@@ -496,7 +496,7 @@ def launch(path):
     argv = [SDL, path, "/gateway:type:arm", "/sec:aad"]
     if UPN:
         argv.append(f"/u:{UPN}")
-    argv += ["/sound:sys:pulse", "/microphone", "/cert:ignore",
+    argv += ["/sound:sys:pulse", "/microphone", "/cert:tofu",
              "/f", "/scale-desktop:200", "-multimon", "/log-level:info"]
     print("launching:", " ".join(argv))
     print("log:", log)
