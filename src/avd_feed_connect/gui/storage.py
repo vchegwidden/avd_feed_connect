@@ -33,6 +33,12 @@ MULTIMON_VALUES = ["auto", "off", "on"]
 # default, which is itself verify, so the secure mode is the out-of-the-box one.
 CERT_LABELS = ["Automatic (verify)", "Verify", "Don't verify (if you can't connect)"]
 CERT_VALUES = ["auto", "verify", "ignore"]
+# sdl-freerdp's own Right Shift + key shortcuts (D disconnects the session, Enter
+# toggles fullscreen). "auto" leaves FreeRDP's config untouched; "off" passes every
+# key through to the remote desktop.
+HOTKEY_LABELS = ["Automatic (FreeRDP default)", "Enabled (Right Shift + key)",
+                 "Disabled (send all keys to the PC)"]
+HOTKEY_VALUES = ["auto", "on", "off"]
 
 
 def icon_path(res_id):

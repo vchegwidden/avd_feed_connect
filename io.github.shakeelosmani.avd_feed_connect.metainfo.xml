@@ -60,6 +60,29 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.4.8" date="2026-10-07">
+      <description>
+        <ul>
+          <li>Fixed copying text from the local machine into the remote session
+          when running under Wayland (XWayland): pasted text now arrives
+          correctly instead of silently failing. The 0.4.3 clipboard fix only
+          covered native X11 sessions; this backports the later FreeRDP fix that
+          also handles the XWayland clipboard format. Thanks to Ewerton Mattos
+          for the fix.</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.4.7" date="2026-10-05">
+      <description>
+        <ul>
+          <li>New per-workspace "Client shortcuts" setting. The remote client
+          reserves Right Shift + a key for its own shortcuts (disconnect,
+          fullscreen, and so on), which can swallow those keys or, with a stuck
+          modifier, end the session unexpectedly. You can now leave them as-is,
+          force them on, or disable them so every key goes to the remote PC.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.4.6" date="2026-10-02">
       <description>
         <ul>

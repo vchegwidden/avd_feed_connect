@@ -6,6 +6,7 @@ a PTY, so it can resolve the connection-time AAD prompt silently — see
 :mod:`avd_feed_connect.gui.connect`; this module is the CLI path.
 """
 
+import json
 import os
 import shlex
 import subprocess
@@ -38,6 +39,48 @@ def build_display_args(path, extra, want_multimon):
     set_rdp_multimon(path, want_multimon)
     return ([] if dynamic else ["/f"]) + [
         "/multimon" if want_multimon else "-multimon"] + options
+
+
+# sdl-freerdp reserves <modifier>+key for its own shortcuts (D disconnects, Enter
+# toggles fullscreen, ...), swallowing those keys before the remote sees them.
+# The modifier lives in its user config file, not on the command line.
+HOTKEY_MODIFIERS = {"on": ["KMOD_RSHIFT"], "off": ["KMOD_NONE"]}
+
+
+def sdl_config_path():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(config.HOME, ".config")
+    return os.path.join(base, "freerdp", "sdl-freerdp.json")
+
+
+def apply_client_hotkeys(mode, path=None):
+    """Enable ("on", FreeRDP's Right Shift default) or disable ("off") the SDL
+    client's built-in shortcuts by editing its config. Any other mode ("auto")
+    leaves the file alone. Other keys in an existing file are preserved; a file
+    we can't parse is never overwritten. Returns False if nothing was written."""
+    modifiers = HOTKEY_MODIFIERS.get(mode)
+    if modifiers is None:
+        return False
+    path = path or sdl_config_path()
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return False
+    except FileNotFoundError:
+        data = {}
+    except (OSError, ValueError):
+        return False
+    if data.get("SDL_KeyModMask") == modifiers:
+        return True
+    data["SDL_KeyModMask"] = modifiers
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+    except OSError:
+        return False
+    return True
 
 
 def build_argv(sdl, path, upn):

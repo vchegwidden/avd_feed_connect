@@ -59,7 +59,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from avd_feed_connect import config, http  # noqa: E402
 from avd_feed_connect.auth.oauth import _b64url  # noqa: E402
 from avd_feed_connect.client import AvdClient  # noqa: E402
-from avd_feed_connect.rdp.launcher import build_display_args  # noqa: E402
+from avd_feed_connect.rdp.launcher import (  # noqa: E402
+    apply_client_hotkeys, build_display_args)
 from avd_feed_connect.gui.theme import CSS_BASE, PALETTE_DARK, PALETTE_LIGHT  # noqa: E402
 from avd_feed_connect.gui.demo import demo_resources  # noqa: E402
 from avd_feed_connect.gui import storage  # noqa: E402
@@ -70,7 +71,7 @@ af = AvdClient()
 
 APP_ID = "io.github.shakeelosmani.avd_feed_connect"
 APP_NAME = "AVD Feed + Connect Linux"
-APP_VERSION = "0.4.6"
+APP_VERSION = "0.4.8"
 
 
 
@@ -908,6 +909,7 @@ class AvdApp(Gtk.Application):
         cert_mode = os.environ.get("AVD_CERT", "").strip().lower() \
             or self._eff("cert", res)
         cert_flag = "/cert:ignore" if cert_mode == "ignore" else "/cert:tofu"
+        apply_client_hotkeys(self._eff("hotkeys", res))
         argv += ["/sound:sys:pulse", "/microphone", cert_flag,
                  f"/scale-desktop:{scale}", "/log-level:info",
                  # bandwidth/quality + resilience + keepalive:
@@ -1130,6 +1132,11 @@ class AvdApp(Gtk.Application):
         cert_dd.set_selected(storage.CERT_VALUES.index(cv) if cv in storage.CERT_VALUES else 0)
         box.append(self._form_row("Server certificate", cert_dd))
 
+        hk_dd = Gtk.DropDown(model=Gtk.StringList.new(storage.HOTKEY_LABELS))
+        hv = cur.get("hotkeys", "auto")
+        hk_dd.set_selected(storage.HOTKEY_VALUES.index(hv) if hv in storage.HOTKEY_VALUES else 0)
+        box.append(self._form_row("Client shortcuts", hk_dd))
+
         extra_entry = Gtk.Entry()
         extra_entry.set_text(cur.get("extra_args", ""))
         extra_entry.set_placeholder_text("advanced: e.g. /gfx /network:auto")
@@ -1153,11 +1160,13 @@ class AvdApp(Gtk.Application):
                 "scale": storage.SCALE_VALUES[scale_dd.get_selected()],
                 "multimon": storage.MULTIMON_VALUES[mm_dd.get_selected()],
                 "cert": storage.CERT_VALUES[cert_dd.get_selected()],
+                "hotkeys": storage.HOTKEY_VALUES[hk_dd.get_selected()],
                 "extra_args": extra_entry.get_text().strip(),
             }
             # drop an all-default entry so the file stays tidy
             if entry["scale"] == "auto" and entry["multimon"] == "auto" \
-                    and entry["cert"] == "auto" and not entry["extra_args"]:
+                    and entry["cert"] == "auto" and entry["hotkeys"] == "auto" \
+                    and not entry["extra_args"]:
                 self._settings.pop(key, None)
             else:
                 self._settings[key] = entry

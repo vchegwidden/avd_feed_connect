@@ -172,3 +172,28 @@ def test_multimon_appends_when_absent(tmp_path):
 
 def test_multimon_missing_file_is_noop(tmp_path):
     set_rdp_multimon(str(tmp_path / "nope.rdp"), True)  # must not raise
+
+
+def test_client_hotkeys_off_preserves_other_keys(tmp_path):
+    import json
+    from avd_feed_connect.rdp.launcher import apply_client_hotkeys
+
+    path = tmp_path / "freerdp" / "sdl-freerdp.json"
+    path.parent.mkdir()
+    path.write_text('{"SDL_Grab": "SDL_SCANCODE_K"}')
+    assert apply_client_hotkeys("off", str(path))
+    assert json.loads(path.read_text()) == {
+        "SDL_Grab": "SDL_SCANCODE_K", "SDL_KeyModMask": ["KMOD_NONE"]}
+    assert apply_client_hotkeys("on", str(path))
+    assert json.loads(path.read_text())["SDL_KeyModMask"] == ["KMOD_RSHIFT"]
+
+
+def test_client_hotkeys_auto_and_bad_config_left_alone(tmp_path):
+    from avd_feed_connect.rdp.launcher import apply_client_hotkeys
+
+    path = tmp_path / "sdl-freerdp.json"
+    assert not apply_client_hotkeys("auto", str(path))
+    assert not path.exists()
+    path.write_text("{not json")
+    assert not apply_client_hotkeys("off", str(path))
+    assert path.read_text() == "{not json"
