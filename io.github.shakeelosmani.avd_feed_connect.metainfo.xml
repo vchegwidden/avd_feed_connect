@@ -60,6 +60,133 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.9.0" date="2026-11-01">
+      <description>
+        <ul>
+          <li>In-session WebAuthn/FIDO2 redirection: a hardware security key
+          (such as a YubiKey) plugged into your local machine can now be used
+          to authenticate inside the remote session — for example to sign in to
+          websites from within the AVD desktop. The bundled FreeRDP now builds
+          the RDPEWA channel with libfido2 for this. Contributed by
+          @diecknet.</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.8.0" date="2026-10-27">
+      <description>
+        <ul>
+          <li>RemoteApp tiles that only showed "Loading" and then hung can now
+          be opened as the host's full desktop: right-click the tile →
+          Settings → Open RemoteApp as → Full desktop, then launch the app from
+          inside the desktop. It is off by default, shown only on RemoteApp
+          tiles, and remembered per resource.</li>
+          <li>This works only when the host pool actually grants a full desktop
+          session for that account; otherwise the app window integration of the
+          bundled client remains limited.</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.7.0" date="2026-10-22">
+      <description>
+        <ul>
+          <li>You can now choose how each connection authenticates — Automatic,
+          Microsoft Entra ID, or NLA — and the app remembers what worked for
+          each desktop.</li>
+          <li>Client shortcuts are now configurable: keep the Right Shift
+          defaults, disable them, or set a Custom modifier and keys, with a
+          one-click restore to the FreeRDP defaults.</li>
+          <li>The connecting overlay now has a cancel button, and closing the
+          sign-in window cancels that connection cleanly so you can retry
+          without restarting; other accounts' sessions stay connected.</li>
+          <li>Fixed a clipboard hang when pasting formatted content from the
+          remote desktop into local applications on GNOME Wayland (temporary
+          SDL patch pending the upstream fix).</li>
+          <li>Thanks to Hernán López for all of the above.</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.6.2" date="2026-10-21">
+      <description>
+        <ul>
+          <li>Fixed the language picker: choosing a language no longer just
+          closes the menu. Language now lives in the Default settings dialog,
+          where it applies immediately.</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.6.1" date="2026-10-21">
+      <description>
+        <ul>
+          <li>The Spanish translation now covers the unified account view and
+          the GNOME virtual-desktop setting, which previously stayed in
+          English.</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.6.0" date="2026-10-20">
+      <description>
+        <ul>
+          <li>An optional unified view shows the workspaces from all of your
+          signed-in accounts together; switch between "By account" and
+          "All accounts" from the account menu.</li>
+          <li>The app can now be used in English or regional Spanish (Latin
+          America, Spain, Argentina); choose the language, or follow the
+          system, under Settings.</li>
+          <li>On GNOME, desktop connections can optionally open in their own
+          virtual desktop and switch to it on connect (needs the small
+          companion GNOME extension; off by default).</li>
+          <li>Each connection now keeps its own log file instead of
+          overwriting the previous one, so earlier diagnostics are preserved.</li>
+          <li>Thanks to Hernán López for all of the above.</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.5.0" date="2026-10-20">
+      <description>
+        <ul>
+          <li>Sign in to more than one Microsoft work account and switch
+          between companies from the account menu, without signing out.
+          Open connections stay running while you switch. Each account keeps
+          its own sign-in, workspaces, and connection preferences, and can be
+          given a custom name. A separate Settings (gear) menu now holds
+          Appearance, system tray, and default connection options, and these
+          menus and the connection-settings windows follow the app's dark
+          theme. Thanks to Hernán López for the contribution.</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.4.12" date="2026-10-16">
+      <description>
+        <ul>
+          <li>The tray icon is now visible on dark panels — it takes on the
+          panel's own color instead of staying a dark shape that disappeared
+          against dark bars. Thanks to Ewerton Mattos for the fix.</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.4.11" date="2026-10-13">
+      <description>
+        <ul>
+          <li>Updated the bundled FreeRDP to 3.32.2, fixing a clipboard bug
+          where copied text could lose or gain a character (for example pasting
+          "1234" instead of "12345") when copying between the local machine and
+          the remote PC. Thanks to Ewerton Mattos for the fix.</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.4.10" date="2026-10-11">
+      <description>
+        <ul>
+          <li>New Sign-in browser option (under the account menu → Default
+          settings). If your organization's Conditional Access policy only
+          allows sign-in from a Windows device or Microsoft Edge, set it to
+          Microsoft Edge on Windows (or Chrome on Windows, or a custom
+          user-agent) so the built-in sign-in window is no longer blocked for
+          being Linux. Leave it on Automatic otherwise. Thanks to Jeffezbr for
+          the request.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.4.9" date="2026-10-08">
       <description>
         <ul>

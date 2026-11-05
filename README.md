@@ -49,6 +49,28 @@ a plaintext file. The embedded sign-in keeps your Microsoft SSO session between
 launches, so re-authenticating (for example when a Conditional Access policy
 expires your token) is usually a single click rather than a full password+MFA.
 
+## Multiple work accounts
+
+Open the avatar/email menu and choose **Add account** to sign in to another
+company. The same menu lists saved accounts; choosing one displays its
+workspaces. Each entry shows a custom account name, or the email domain, above the account email.
+Use the pencil button to set a local display name; leaving it empty restores
+the email domain. Existing remote desktop connections stay open when you switch.
+The tray groups workspaces by account and supports connecting, focusing, and
+disconnecting sessions independently of the account shown in the window.
+
+Each account has separate credentials, Microsoft sign-in cookies, workspace
+and icon caches, connection files, and resource preferences. **Sign out**
+removes only the selected account. Established RDP sessions remain open until
+you disconnect them. Saved sessions from earlier versions are migrated on
+first launch; global preferences are retained.
+
+The separate **Settings** (gear) menu contains **Appearance**, **System tray**,
+and **Default settings…**. These apply across accounts; right-clicking a
+workspace changes that account's resource preferences. The CLI uses the
+selected saved account; `logout` clears that account's credentials and profile.
+A combined view of all accounts is deferred to a later release.
+
 ## Silent connection sign-in
 
 FreeRDP's `/sec:aad` needs an Entra token at connect time. Rather than let
@@ -74,7 +96,7 @@ token is fetched in the background and the session starts with nothing on
 screen yet — the app stays in the tray and no window is shown until the remote
 desktop itself appears. That pause is normal; it isn't stuck.
 
-Two options in the account menu, under **System tray** (both off by default,
+Two options in the **Settings** (gear) menu, under **System tray** (both off by default,
 so closing the window still quits the app):
 
 - **Keep running in the tray when closed** — the window's close button hides it
@@ -140,6 +162,31 @@ flatpak run org.flatpak.Builder --user --install --force-clean build-dir \
 flatpak run io.github.shakeelosmani.avd_feed_connect
 ```
 
+> **Building your own code changes?** The manifest above pins the app module to a
+> published commit (a `type: git` source), so it builds the *released* code, not
+> your working tree — and the release workflow and the planned Flathub listing
+> both rely on it staying a pinned git source. To build local changes, copy the
+> manifest and point that one copy at the working tree instead of editing the
+> tracked file:
+>
+> ```bash
+> cp io.github.shakeelosmani.avd_feed_connect.yml local.yml
+> ```
+>
+> In `local.yml`, change only the last module's (`avd-feed-connect`) source from
+> the `type: git` / `url` / `commit` block to:
+>
+> ```yaml
+>     sources:
+>       - type: dir
+>         path: .
+> ```
+>
+> then `flatpak run org.flatpak.Builder --user --install --force-clean build-dir local.yml`.
+> Keep the copy at the repo root (so the `patches/…` paths still resolve) and
+> don't commit it. For quick GUI/CLI iteration without a Flatpak rebuild, run it
+> unpackaged (below).
+
 ## Run unpackaged (development)
 
 The same code runs without Flatpak if you have PyGObject (Gtk 4.0, WebKit 6.0)
@@ -188,11 +235,13 @@ override it, the easiest way is right inside the app.
 #### In-app settings (no terminal, remembered per workspace)
 
 - **Per workspace:** right-click a workspace tile → set its **Display scale**,
-  **Monitors** (single / all / automatic), **Server certificate**, **Client shortcuts**, and any
-  **Advanced flags**. These are remembered per resource, so a RemoteApp and a
-  full Desktop can differ.
-- **Defaults for everything:** the **⋯ menu → Default settings…** sets the
-  fallback used by any workspace left on "Automatic".
+  **Monitors** (single / all / automatic), **Server certificate**, **Session
+  authentication**, **Client shortcuts**, and any **Advanced flags** — plus, on a
+  **RemoteApp** tile only, **Open RemoteApp as**. These are remembered per
+  resource, so a RemoteApp and a full Desktop can differ.
+- **Defaults for everything:** the **Settings (gear) menu → Default settings…** sets the
+  fallback used by any workspace left on "Automatic", plus the account-wide
+  **Sign-in browser** identity.
 
 Precedence is: a workspace's own setting → your Default settings → automatic
 detection. (Environment variables, below, override even these — for scripting.)
@@ -208,6 +257,36 @@ Default settings). That restores the old behaviour of accepting any certificate.
 Leave it on **Verify** whenever you can; only turn it off if it's actually
 blocking you. (Scripting override: `AVD_CERT=ignore` or `AVD_CERT=verify`.)
 
+**Open RemoteApp as (app window / full desktop).** A **RemoteApp** tile is a
+single published app (e.g. a line-of-business tool) rather than a full desktop.
+The bundled SDL client's RemoteApp/RAIL window integration is limited and the app
+window may never appear — the session connects, shows "Loading", and then looks
+stuck or drops. If that happens, right-click that tile → **Settings** → set
+**Open RemoteApp as → Full desktop**. The app then connects to the host's
+**whole desktop** so you can launch the published app from inside it, the way a
+desktop tile works.
+
+*Why this route.* True single-window RemoteApp (RAIL) rendering needs a client
+that can draw remote app windows on their own; the bundled SDL FreeRDP marks its
+RAIL support experimental and, in practice, draws no window for these tiles, so
+the session just hangs. Rather than ship a heavier RAIL-capable client to
+everyone for one edge case, this option sidesteps RAIL entirely: it rewrites only
+that session's downloaded `.rdp` to request a full desktop instead of a published
+app, while keeping the RemoteApp's routing info (`RemoteApplicationProgram` and
+`loadbalanceinfo`, which Azure Virtual Desktop's endpoint resolver still requires)
+intact so AVD can broker the host. It applies to that one RemoteApp tile only, is
+**off by default**, and is never shown on Desktop tiles.
+
+> **Backend requirement.** This only works if the RemoteApp's host pool /
+> application group will actually hand out a **full desktop** session to your
+> account. Many AVD deployments publish an app group as RemoteApp-only and do not
+> grant desktop access on the same hosts — there the full-desktop request is
+> refused and you will not connect. If you can't log in after switching, the host
+> isn't offering a desktop and this toggle can't help; you'd need the admin to
+> grant desktop access (or a RAIL-capable client).
+
+(Scripting override: `AVD_REMOTEAPP=desktop`.)
+
 **Client shortcuts (Right Shift + key).** The bundled SDL client reserves
 Right Shift + key for its own shortcuts (D disconnects, Enter toggles
 fullscreen, R resizable, G keyboard grab, M minimize), so those keys never reach
@@ -216,6 +295,28 @@ under XWayland), an ordinary Ctrl+D can end the session. Set **Client
 shortcuts → Disabled** to pass every key through. The choice is written to
 FreeRDP's own `~/.config/freerdp/sdl-freerdp.json` (`SDL_KeyModMask`) on each
 connect; **Automatic** leaves that file untouched.
+
+**Sign-in browser (if your organization blocks Linux at sign-in).** Some
+tenants have a Conditional Access policy that only lets you sign in from a
+**Windows device** or **Microsoft Edge**, and it decides that from the browser
+identity (User-Agent) the sign-in sends. The built-in sign-in window is Linux
+WebKit, so such a tenant blocks it — the same wall you hit in a web browser
+until you install a "User-Agent switcher" extension. This setting is that
+switch, built in: in **⋯ menu → Default settings…** set **Sign-in browser** to
+**Microsoft Edge on Windows** (or **Google Chrome on Windows**) and every
+sign-in window presents that identity instead, which is enough to satisfy those
+policies. **Custom…** lets you paste any User-Agent string verbatim.
+
+Leave it on **Automatic** unless a sign-in is actually being blocked —
+**Automatic** is the normal Linux identity and is what everyone who isn't behind
+such a policy should keep.
+
+It is a single, **account-wide** choice (so it lives in Default settings, not on
+individual workspaces): the first account sign-in and every connection share one
+signed-in session, so they must all present the **same** identity — if they
+differed, Microsoft would see an inconsistent device for that session and refuse
+to connect. The setting changes only the sign-in window's identity — not the
+remote session — and takes effect on your next sign-in.
 
 **Resizable window (dynamic resolution):** by default the session opens
 fullscreen. If you'd rather have a resizable window whose remote resolution
@@ -293,6 +394,7 @@ Both methods write the same setting.
 |---|---|
 | `AVD_SCALE` | Force the remote scale percentage (`100`, `125`, `150`, `200`, …). Overrides the auto HiDPI detection. |
 | `AVD_MULTIMON` | Force multi-monitor on (`1`/`on`) or off (`0`/`off`). Overrides the auto monitor-count detection. |
+| `AVD_REMOTEAPP` | `desktop` opens **every** RemoteApp tile as the host's full desktop instead of the app window (the per-tile **Open RemoteApp as** setting does the same for one tile). |
 | `AVD_EXTRA_ARGS` | Extra `sdl-freerdp` flags appended verbatim, e.g. `"/gfx"`, `"/network:auto"`, or your own `/multimon` / `-multimon` (which then wins over the auto choice). |
 | `AVD_SDL_FREERDP` | Path to the `sdl-freerdp` binary (defaults to the bundled one). |
 | `AVD_TRAY` | `0`/`off` disables the tray icon (closing the window then always quits). |
@@ -378,3 +480,61 @@ Flatpak install. Contributions welcome.
 
 MIT for this app's code. Bundled components keep their own licenses (FreeRDP:
 Apache-2.0, SDL: Zlib).
+
+### Optional GNOME connection workspaces
+
+On GNOME, in **Default settings**, enable **Start connection in a new virtual desktop** to
+place desktop connections in separate GNOME workspaces. A resource's settings
+can inherit the default, enable it, or disable it. Remote apps are unaffected.
+The app switches to the session's workspace after successful logon. The default
+is disabled; without the companion extension, connections open normally. The
+option is hidden on other desktops, and saved enabled preferences do not invoke
+GNOME integration there. Backend selection is separate from the preference and
+launch lifecycle so future desktop integrations can supply their own capabilities;
+this release implements only GNOME. No generic Wayland support is assumed.
+
+GNOME Wayland requires the small companion Shell extension in
+`gnome-extension/avd-workspaces@avd-feed-connect` (GNOME Shell 50). To install it
+manually from a source checkout, copy that directory into
+`~/.local/share/gnome-shell/extensions/`, log out and back in, then enable
+**AVD connection workspaces** in GNOME Extensions. Installation and enablement
+are explicit user actions; the app never performs either automatically.
+The Flatpak manifest includes permission for the extension's dedicated D-Bus
+name. Existing installations need a build containing that permission.
+
+Placement uses an exact random FreeRDP window title rather than resource names
+or sandbox PIDs. It waits briefly for the desktop window after logon, reuses an
+empty trailing workspace when available, and otherwise appends one. Reconnects
+and focus actions reuse the session; failed launches create no workspace.
+No global workspace settings are changed and no workspace is deleted: GNOME
+reclaims empty dynamic workspaces normally; with fixed workspaces, an existing
+empty workspace is reserved, or placement falls back to the current workspace
+if none is available. The configured number of workspaces is preserved. On secondary monitors GNOME's existing
+“Workspaces on primary display only” preference still applies. Display hotplug
+windows created later by FreeRDP are outside the initial placement attempt.
+
+### UI translations
+
+Select **Settings → Language** to use the system language or choose English,
+Latin American Spanish, Spain Spanish, or Argentina Spanish. Changes are saved
+and applied immediately, including open settings and tray menus. System selection
+uses `LANGUAGE` (first preference), then `LC_ALL`, `LC_MESSAGES`, and `LANG`;
+`C`/`POSIX` message locales always use English. Latin American Spanish locales
+map to `es-419`; unsupported languages and regions use English.
+
+English strings stay in Python source. UTF-8 JSON catalogs in
+`src/avd_feed_connect/locales/` use the English string as their key. `es.json`
+is deliberately shared by all three Spanish variants; regional files contain
+only wording overrides. A missing or empty translation falls back to the
+English source. Keep named `{placeholders}`, newlines and technical identifiers
+intact. The supported languages use singular for one and plural otherwise.
+To add or update translations, edit those catalogs and validate with:
+
+```sh
+python -m pytest tests/test_i18n.py
+python -m pip wheel --no-deps .
+```
+
+The catalog tests check source coverage and placeholder consistency. Setuptools
+includes catalogs as package data; the Flatpak manifest copies the entire
+Python package, including these catalogs, without a separate compilation step.

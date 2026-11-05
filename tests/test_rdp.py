@@ -2,7 +2,8 @@
 
 from avd_feed_connect.rdp import build_argv, set_rdp_multimon
 from avd_feed_connect.rdp.launcher import build_display_args
-from avd_feed_connect.rdp.resources import set_rdp_dynamic_resolution
+from avd_feed_connect.rdp.resources import (
+    set_rdp_dynamic_resolution, rdp_is_remoteapp, set_rdp_desktop_mode)
 
 
 def test_dynamic_display_settings_in_freerdp(tmp_path):
@@ -108,36 +109,36 @@ def test_malformed_display_args_are_reported(tmp_path):
     raise AssertionError("Malformed flags must not be silently ignored")
 
 
-def test_argv_core_flags():
-    argv = build_argv("/app/bin/sdl-freerdp", "/tmp/x.rdp", "")
+def test_argv_core_flags(tmp_path):
+    argv = build_argv("/app/bin/sdl-freerdp", _rdp(tmp_path, "enablerdsaadauth:i:1\n"), "")
     assert argv[0] == "/app/bin/sdl-freerdp"
-    assert argv[1] == "/tmp/x.rdp"
+    assert argv[1] == _rdp(tmp_path, "enablerdsaadauth:i:1\n")
     assert "/gateway:type:arm" in argv
     assert "/sec:aad" in argv
     assert "/f" in argv
     assert "-multimon" in argv
 
 
-def test_argv_includes_user_when_upn_set():
-    argv = build_argv("sdl-freerdp", "x.rdp", "sam@contoso.com")
+def test_argv_includes_user_when_upn_set(tmp_path):
+    argv = build_argv("sdl-freerdp", _rdp(tmp_path, "enablerdsaadauth:i:1\n"), "sam@contoso.com")
     assert "/u:sam@contoso.com" in argv
 
 
-def test_argv_omits_user_when_no_upn():
-    argv = build_argv("sdl-freerdp", "x.rdp", "")
+def test_argv_omits_user_when_no_upn(tmp_path):
+    argv = build_argv("sdl-freerdp", _rdp(tmp_path, "enablerdsaadauth:i:1\n"), "")
     assert not any(a.startswith("/u:") for a in argv)
 
 
-def test_argv_verifies_cert_by_default(monkeypatch):
+def test_argv_verifies_cert_by_default(tmp_path, monkeypatch):
     monkeypatch.delenv("AVD_CERT", raising=False)
-    argv = build_argv("sdl-freerdp", "x.rdp", "")
+    argv = build_argv("sdl-freerdp", _rdp(tmp_path, "enablerdsaadauth:i:1\n"), "")
     assert "/cert:tofu" in argv
     assert "/cert:ignore" not in argv
 
 
-def test_argv_cert_ignore_opt_out(monkeypatch):
+def test_argv_cert_ignore_opt_out(tmp_path, monkeypatch):
     monkeypatch.setenv("AVD_CERT", "ignore")
-    argv = build_argv("sdl-freerdp", "x.rdp", "")
+    argv = build_argv("sdl-freerdp", _rdp(tmp_path, "enablerdsaadauth:i:1\n"), "")
     assert "/cert:ignore" in argv
     assert "/cert:tofu" not in argv
 
@@ -146,6 +147,30 @@ def _rdp(tmp_path, body):
     p = tmp_path / "x.rdp"
     p.write_text(body)
     return str(p)
+
+
+def test_rdp_is_remoteapp_detects_mode(tmp_path):
+    assert rdp_is_remoteapp(_rdp(tmp_path, "full address:s:h\nremoteapplicationmode:i:1\n"))
+    assert not rdp_is_remoteapp(_rdp(tmp_path, "full address:s:h\nremoteapplicationmode:i:0\n"))
+    assert not rdp_is_remoteapp(_rdp(tmp_path, "full address:s:h\n"))   # desktop (no property)
+    assert not rdp_is_remoteapp(str(tmp_path / "missing.rdp"))          # I/O error → False
+
+
+def test_set_rdp_desktop_mode_forces_desktop(tmp_path):
+    path = _rdp(tmp_path, "full address:s:h\nremoteapplicationmode:i:1\n"
+                          "remoteapplicationprogram:s:||VC\nalternate shell:s:||VC\n"
+                          "loadbalanceinfo:s:tsv.x\nusername:s:u\n")
+    set_rdp_desktop_mode(path)
+    lines = open(path).read().splitlines()
+    assert "remoteapplicationmode:i:0" in lines
+    assert "remoteapplicationmode:i:1" not in lines
+    # AVD ARM resolver needs these — must be KEPT:
+    assert "remoteapplicationprogram:s:||VC" in lines
+    assert "loadbalanceinfo:s:tsv.x" in lines
+    # but the app-as-shell is dropped so the desktop shell runs:
+    assert not any(l.lower().startswith("alternate shell") for l in lines)
+    assert "username:s:u" in lines           # unrelated properties preserved
+    assert not rdp_is_remoteapp(path)         # and FreeRDP now sees a desktop
 
 
 def test_multimon_disable_rewrites_existing_property(tmp_path):
@@ -197,3 +222,122 @@ def test_client_hotkeys_auto_and_bad_config_left_alone(tmp_path):
     path.write_text("{not json")
     assert not apply_client_hotkeys("off", str(path))
     assert path.read_text() == "{not json"
+
+
+def test_account_downloads_keep_same_title_resources_separate(tmp_path, monkeypatch):
+    from avd_feed_connect.rdp import resources
+    monkeypatch.setattr(resources.http, 'get', lambda url, token: (200, {}, 'username:s:' + token))
+    a = resources.download_rdp('a', {'id': 'one', 'title': 'Desktop', 'rdp_url': 'https://example.microsoft.com/one'}, str(tmp_path / 'a'))
+    b = resources.download_rdp('b', {'id': 'two', 'title': 'Desktop', 'rdp_url': 'https://example.microsoft.com/two'}, str(tmp_path / 'a'))
+    c = resources.download_rdp('c', {'id': 'one', 'title': 'Desktop', 'rdp_url': 'https://example.microsoft.com/one'}, str(tmp_path / 'b'))
+    assert len({a, b, c}) == 3
+    assert open(a).read() == 'username:s:a'
+    assert open(b).read() == 'username:s:b'
+    assert open(c).read() == 'username:s:c'
+
+
+def test_cli_repeated_connections_preserve_each_log(tmp_path, monkeypatch):
+    from avd_feed_connect import config
+    from avd_feed_connect.rdp.launcher import RdpLauncher
+
+    output = tmp_path / 'feed'
+    output.mkdir()
+    legacy = output / 'feed-last-run.log'
+    legacy.write_text('previous session\n')
+    monkeypatch.setattr(config, 'OUT', str(output))
+    client = tmp_path / 'fake-freerdp'
+    client.write_text('#!/usr/bin/python3\n'
+                      'import pathlib, sys\n'
+                      'print(pathlib.Path(sys.argv[1]).read_text(), end="", flush=True)\n'
+                      'print("diagnostic stderr", file=sys.stderr)\n')
+    client.chmod(0o755)
+    rdp = tmp_path / 'desktop.rdp'
+    launcher = RdpLauncher(sdl=str(client), sdl_libs='')
+    rdp.write_text('first connection\n')
+    assert launcher.launch(str(rdp)) == 0
+    first = {p: p.read_bytes() for p in output.glob('*.log')}
+    rdp.write_text('second connection\n')
+    assert launcher.launch(str(rdp)) == 0
+
+    assert len(list(output.glob('*.log'))) == 3
+    assert all(p.read_bytes() == content for p, content in first.items())
+    assert legacy.read_text() == 'previous session\n'
+    sessions = [p.read_text() for p in output.glob('feed_*.log')]
+    assert sorted(sessions) == ['first connection\ndiagnostic stderr\n',
+                                'second connection\ndiagnostic stderr\n']
+
+
+def test_log_paths_remain_unique_with_identical_timestamps(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from pathlib import Path
+    from avd_feed_connect.rdp import launcher
+
+    instant = datetime(2026, 10, 20, 19, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(launcher, 'datetime', SimpleNamespace(now=lambda tz: instant))
+    paths = [Path(launcher.session_log_path(tmp_path, 'session_desktop'))
+             for _ in range(20)]
+    assert len(set(paths)) == 20
+    assert all(p.parent == tmp_path for p in paths)
+    assert all(p.name.startswith('session_desktop_20261020T193000.000000Z_')
+               and p.suffix == '.log' for p in paths)
+
+
+def test_custom_hotkeys_write_all_actions_and_preserve_other_preferences(tmp_path):
+    import json
+    from avd_feed_connect.rdp.launcher import apply_client_hotkeys
+    path = tmp_path / 'sdl-freerdp.json'
+    path.write_text('{"unrelated": 42}')
+    custom = {'modifiers': ['KMOD_RCTRL', 'KMOD_RSHIFT'], 'bindings': {
+        'SDL_Disconnect': 'SDL_SCANCODE_F12', 'SDL_Minimize': 'SDL_SCANCODE_M',
+        'SDL_Fullscreen': 'SDL_SCANCODE_RETURN', 'SDL_Resizeable': 'SDL_SCANCODE_R',
+        'SDL_Grab': 'SDL_SCANCODE_G'}}
+    assert apply_client_hotkeys(custom, str(path))
+    data = json.loads(path.read_text())
+    assert data['SDL_KeyModMask'] == ['KMOD_RCTRL', 'KMOD_RSHIFT']
+    assert data['SDL_Disconnect'] == 'SDL_SCANCODE_F12'
+    assert data['unrelated'] == 42
+    assert apply_client_hotkeys('on', str(path))
+    assert json.loads(path.read_text())['SDL_Disconnect'] == 'SDL_SCANCODE_F12'
+
+
+def test_invalid_custom_hotkeys_do_not_modify_config(tmp_path):
+    from avd_feed_connect.rdp.launcher import apply_client_hotkeys
+    path = tmp_path / 'sdl-freerdp.json'
+    path.write_text('{}')
+    for value in ({'modifiers': [], 'bindings': {}},
+                  {'modifiers': ['INVALID'], 'bindings': {}},
+                  {'modifiers': ['KMOD_RSHIFT'], 'bindings': {'SDL_Disconnect': 'INVALID'}}):
+        assert not apply_client_hotkeys(value, str(path))
+        assert path.read_text() == '{}'
+
+
+def test_restore_hotkeys_removes_only_managed_overrides(tmp_path):
+    import json
+    from avd_feed_connect.rdp.launcher import apply_client_hotkeys, HOTKEY_DEFAULTS
+    path = tmp_path / 'sdl.json'
+    path.write_text(json.dumps(dict(HOTKEY_DEFAULTS, SDL_KeyModMask=['KMOD_RCTRL'], unrelated=42)))
+    assert apply_client_hotkeys('defaults', str(path))
+    assert json.loads(path.read_text()) == {'unrelated': 42}
+
+
+def test_custom_hotkeys_preserve_unreadable_and_non_object_files(tmp_path):
+    from avd_feed_connect.rdp.launcher import apply_client_hotkeys, HOTKEY_DEFAULTS
+    path = tmp_path / 'sdl.json'
+    custom = {'modifiers': ['KMOD_RCTRL'], 'bindings': dict(HOTKEY_DEFAULTS)}
+    for content in ('not JSON', '[]', 'null'):
+        path.write_text(content)
+        assert not apply_client_hotkeys(custom, str(path))
+        assert path.read_text() == content
+
+
+def test_custom_hotkeys_reject_duplicate_unknown_and_malformed_keys(tmp_path):
+    from avd_feed_connect.rdp.launcher import apply_client_hotkeys, HOTKEY_DEFAULTS
+    path = tmp_path / 'sdl.json'
+    path.write_text('{"keep": true}')
+    for bindings in (dict(HOTKEY_DEFAULTS, SDL_Disconnect='SDL_SCANCODE_M'),
+                     dict(HOTKEY_DEFAULTS, SDL_Disconnect='SDL_SCANCODE_UNKNOWN'),
+                     dict(HOTKEY_DEFAULTS, SDL_Disconnect=[])):
+        assert not apply_client_hotkeys({'modifiers': ['KMOD_RSHIFT'], 'bindings': bindings}, str(path))
+        assert path.read_text() == '{"keep": true}'
+    assert not apply_client_hotkeys({'modifiers': [{}], 'bindings': dict(HOTKEY_DEFAULTS)}, str(path))

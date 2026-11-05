@@ -22,7 +22,7 @@ camera/mic/gfx behave exactly as before.
 
 A tray icon (gui.tray, StatusNotifierItem over plain D-Bus — GTK4 has no tray
 API) lists every resource by workspace with Connect / Connect (windowed) /
-Focus window / Disconnect. Opt-in (account menu), while a tray host is present:
+Focus window / Disconnect. Opt-in (Settings menu), while a tray host is present:
 closing the window hides it to the tray, and the app can start hidden there.
 AVD_TRAY=0 turns the tray off.
 
@@ -44,8 +44,10 @@ import secrets
 import shutil
 import signal
 import subprocess
+import shlex
 import pty
 import select
+import uuid
 
 # Software-composite WebKit (our sign-in webview) instead of the DMABUF/GBM
 # GPU path. That path fails to allocate a GBM buffer on some GPUs/drivers
@@ -72,19 +74,27 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from avd_feed_connect import config, http  # noqa: E402
 from avd_feed_connect.auth.oauth import _b64url  # noqa: E402
 from avd_feed_connect.client import AvdClient  # noqa: E402
+from avd_feed_connect.gui.workspaces import select_backend as workspace_backend  # noqa: E402
+from avd_feed_connect.rdp.security import resolve_security  # noqa: E402
+from avd_feed_connect.rdp.attempt import ConnectionAttempt  # noqa: E402
 from avd_feed_connect.rdp.launcher import (  # noqa: E402
-    apply_client_hotkeys, build_display_args)
+    apply_client_hotkeys, build_display_args, session_log_path,
+    HOTKEY_MODIFIER_NAMES, HOTKEY_DEFAULTS, HOTKEY_ACTIONS, HOTKEY_KEYS)
+from avd_feed_connect.rdp.resources import (  # noqa: E402
+    rdp_is_remoteapp, set_rdp_desktop_mode)
+from avd_feed_connect.i18n import _ as tr, ngettext, configure, LANGUAGES  # noqa: E402
+from avd_feed_connect.gui.localization import bind, create, strings  # noqa: E402
 from avd_feed_connect.gui.theme import CSS_BASE, PALETTE_DARK, PALETTE_LIGHT  # noqa: E402
 from avd_feed_connect.gui.demo import demo_resources  # noqa: E402
 from avd_feed_connect.gui import storage, tray_menu, x11focus  # noqa: E402
 from avd_feed_connect.gui.tray import TrayIcon  # noqa: E402
 
-# One process-wide client holds the signed-in session (UPN, tokens); the GUI
-# reads and updates it through this single instance.
-af = AvdClient()
+from avd_feed_connect.accounts import ProfileRegistry, profile_dir, claims_from_token  # noqa: E402
+from avd_feed_connect.auth.tokens import TokenStore  # noqa: E402
+from avd_feed_connect.gui.session import AccountSession  # noqa: E402
 
 APP_NAME = "AVD Feed + Connect Linux"
-APP_VERSION = "0.4.9"
+APP_VERSION = "0.9.0"
 
 
 
@@ -101,27 +111,44 @@ class AvdApp(Gtk.Application):
                              flags=Gio.ApplicationFlags.NON_UNIQUE)
         else:
             super().__init__(application_id=APP_ID)
-        self.token = None
-        self._deadline = 0.0        # monotonic time the access token expires
-        self._refresh_source = 0    # GLib timeout id for the scheduled refresh
-        self._token_lock = threading.Lock()
+        self.registry = ProfileRegistry()
+        if not os.environ.get("AVD_DEMO"):
+            self.registry.migrate_legacy(TokenStore())
+        self.accounts = {}
+        for profile in self.registry.profiles:
+            self.accounts[profile['id']] = AccountSession(
+                profile, self.registry.client(profile['id']),
+                profile_dir(self.registry.root, profile['id']))
+        self.selected_id = self.registry.selected_id
+        self._adding = None
         self.win = None
         self.stack = None
         self.grid = None
         self.status = None
+        self._account_sections = {}
+        self._account_status_widgets = {}
         self._tiles = []            # GTK4 FlowBox has no get_children(); track ours
         self._signout_item = None
         self._scale = 1             # client display scale factor (1 or 2 = HiDPI)
         self._n_monitors = 1        # how many monitors the compositor reports
-        self._settings = storage.load_settings()   # {"_default": {...}, "<res id>": {...}}
-        self._pending_launch = None  # (resource id, windowed) to connect once sign-in completes
+        self._settings = storage.load_settings()   # application-wide defaults and appearance
+        self.view_mode = "all" if self._settings.get("_account_view") == "all" else "account"
+        configure(self._settings.get("_language", "system"))
         self._signin_dlg = None      # the open sign-in window, if any
-        self._web_session_obj = None  # shared persistent WebKit session (SSO cookies)
-        self._connecting = set()      # resource ids currently establishing a session
+        self._connecting = set()      # (account id, resource id) currently connecting
         self._tray = None             # TrayIcon, unless AVD_TRAY=0 or no session bus
-        self._sessions = {}           # resource id → "connecting"/"connected" (tray state)
-        self._tray_toggles = []       # account-menu tray options (need a tray host)
+        self._sessions = {}           # (account id, resource id) → connection state
+        self._tray_toggles = []       # settings-menu tray options (need a tray host)
         self._start_hidden_source = 0  # timeout giving up on "start in the tray"
+
+    def _set_language(self, preference):
+        self._changing_language = True
+        try:
+            configure(preference)
+            self._rebuild_account_menu()
+            self._tray_refresh()
+        finally:
+            self._changing_language = False
 
     # ---- app lifecycle ----------------------------------------------------
     def do_activate(self):
@@ -134,7 +161,7 @@ class AvdApp(Gtk.Application):
         # the window is shown after a short wait, as it would have been.
         start_hidden = bool(self._settings.get("_start_in_tray")
                             and not os.environ.get("AVD_DEMO")
-                            and storage.load_ws_cache()[0])
+                            and bool(self.current and self.current.resources))
         if not start_hidden:
             self.win.present()
         self._detect_displays()
@@ -149,25 +176,166 @@ class AvdApp(Gtk.Application):
         # no sign-in). Used for documentation screenshots so they carry no real
         # account or org details. Never triggered in normal use.
         if os.environ.get("AVD_DEMO"):
-            af.upn = "alex@contoso.com"
+            profile = {'id': uuid.uuid4().hex, 'tid': 'demo', 'oid': 'demo', 'upn': 'alex@contoso.com'}
+            demo_session = AccountSession(profile, AvdClient(), profile_dir(self.registry.root, profile['id']))
+            demo_session.client.upn = profile['upn']
+            self.accounts[profile['id']] = demo_session
+            self.selected_id = profile['id']
             demo = demo_resources()
             self._populate(demo)
-            self._set_status("Signed in as alex@contoso.com")
-            self._set_tile_state("d2", "", "state-connected")
+            self._set_status(tr("Signed in as {account}").format(account="alex@contoso.com"))
+            self._set_tile_state("d2", "state-connected")
             return
         # If we have previously discovered workspaces, show them immediately and
         # refresh the token + feed silently in the background (Windows-App-style
         # persistent session). Only a first run with no cache shows sign-in.
-        cached, cached_upn = storage.load_ws_cache()
-        if cached_upn and not af.upn:
-            af.upn = cached_upn
-        if cached:
-            self._populate(cached)
-            self._set_status(f"{len(cached)} workspaces · refreshing…")
-            threading.Thread(target=self._background_refresh, daemon=True).start()
+        if self.current:
+            self._select_account(self.selected_id)
         else:
-            self._set_status("Signing in…")
-            threading.Thread(target=self._silent_signin, daemon=True).start()
+            self._show("signin")
+
+    @property
+    def current(self):
+        return self.accounts.get(self.selected_id)
+
+    def _visible(self, session):
+        return not session.removed and (self.view_mode == "all" or session is self.current)
+
+    def _select_account(self, profile_id):
+        session = self.accounts.get(profile_id)
+        if not session or session.removed:
+            return
+        self.selected_id = profile_id
+        if not os.environ.get("AVD_DEMO"):
+            self.registry.select(profile_id)
+        self._update_account(session.client.upn)
+        self._rebuild_account_menu()
+        if self.view_mode == "all":
+            self._render_resources()
+            for owner in self.accounts.values():
+                if not owner.removed:
+                    threading.Thread(target=self._background_refresh, args=(owner,), daemon=True).start()
+            return
+        self._clear_tiles()
+        if session.resources:
+            self._populate(session.resources, session)
+        else:
+            self._show("busy", session)
+        self._set_connecting("", "", False, session)
+        threading.Thread(target=self._background_refresh, args=(session,), daemon=True).start()
+
+    def _rebuild_account_menu(self):
+        if not hasattr(self, '_account_rows'):
+            return
+        multiple = sum(not owner.removed for owner in self.accounts.values()) > 1
+        self._view_modes.set_visible(multiple)
+        if not multiple and self.view_mode == "all":
+            self.view_mode = "account"
+            self._settings["_account_view"] = "account"
+            storage.save_settings(self._settings)
+            if hasattr(self, "_resource_box"):
+                self._render_resources()
+        for mode, button in self._view_buttons.items():
+            button.set_active(mode == self.view_mode)
+        row = self._account_rows.get_first_child()
+        while row:
+            self._account_rows.remove(row)
+            row = self._account_rows.get_first_child()
+        for session in self.accounts.values():
+            if session.removed:
+                continue
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+            button = create(Gtk.Button, )
+            button.add_css_class("flat")
+            button.set_hexpand(True)
+            text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            name = session.display_name
+            title = create(Gtk.Label, label=("✓ " if session.id == self.selected_id else "") + name, xalign=0)
+            title.set_ellipsize(3)
+            title.set_max_width_chars(36)
+            title.add_css_class("account-name")
+            email = create(Gtk.Label, label=session.client.upn, xalign=0)
+            email.set_ellipsize(3)
+            email.set_max_width_chars(36)
+            email.add_css_class("account-email")
+            text.append(title)
+            text.append(email)
+            button.set_child(text)
+            button.connect("clicked", lambda _, sid=session.id: (
+                self._account_pop.popdown(), self._select_account(sid)))
+            edit = Gtk.Button.new_from_icon_name("document-edit-symbolic")
+            edit.add_css_class("flat")
+            bind(edit, 'tooltip_text', tr("Edit account name"))
+            edit.connect("clicked", lambda _, owner=session: (
+                self._account_pop.popdown(), self._edit_account_name(owner)))
+            row.append(button)
+            row.append(edit)
+            self._account_rows.append(row)
+        self._account_separator.set_visible(self._account_rows.get_first_child() is not None)
+        self._signout_item.set_sensitive(self.current is not None)
+
+    def _edit_account_name(self, session):
+        if session.removed:
+            return
+        dialog = create(Gtk.Window, title=tr("Edit account name"), transient_for=self.win, modal=True)
+        dialog.add_css_class("avd-settings")
+        dialog.set_default_size(380, -1)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        for margin in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{margin}")(16)
+        entry = Gtk.Entry()
+        bind(entry, 'text', session.profile.get('alias', ''))
+        bind(entry, 'placeholder_text', session.display_name)
+        box.append(create(Gtk.Label, label=session.client.upn, xalign=0))
+        box.append(entry)
+        box.append(create(Gtk.Label, label=tr("Leave empty to use the email domain."),
+                             xalign=0, wrap=True))
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        buttons.set_halign(Gtk.Align.END)
+        cancel = create(Gtk.Button, label=tr("Cancel"))
+        cancel.connect("clicked", lambda *_: dialog.destroy())
+        save = create(Gtk.Button, label=tr("Save"))
+        save.add_css_class("suggested-action")
+
+        def apply(*_):
+            if not session.removed:
+                try:
+                    self.registry.rename(session.id, entry.get_text())
+                except OSError as error:
+                    self._error(tr("Could not save account name: {error}").format(error=str(error)))
+                    return
+                self._rebuild_account_menu()
+                if session is self.current:
+                    self._update_account(session.client.upn)
+                self._tray_refresh()
+                if self.view_mode == "all":
+                    self._render_resources()
+            dialog.destroy()
+
+        save.connect("clicked", apply)
+        entry.connect("activate", apply)
+        buttons.append(cancel)
+        buttons.append(save)
+        box.append(buttons)
+        dialog.set_child(box)
+        dialog.present()
+
+    def _add_account(self):
+        if self._adding:
+            return
+        profile = {'id': uuid.uuid4().hex, 'tid': '', 'oid': '', 'upn': ''}
+        session = AccountSession(profile, self.registry.client(profile['id']),
+                                 profile_dir(self.registry.root, profile['id']))
+        session.client.upn = ""
+        self._adding = session
+        self._interactive_signin(session)
+
+    def _discard_add(self, session):
+        if session is self._adding:
+            session.close()
+            session.web_session = None
+            shutil.rmtree(session.directory, ignore_errors=True)
+            self._adding = None
 
     def _detect_displays(self):
         """Read the client's real display layout from the compositor so the
@@ -186,19 +354,14 @@ class AvdApp(Gtk.Application):
         except Exception:
             self._scale = 1
 
-    def _background_refresh(self):
-        """Silently refresh the token and re-fetch the feed, keeping the cached
-        workspaces on screen if it fails (never auto-bounces to sign-in)."""
-        if not self._do_refresh(silent=True):
-            self._set_status(self._refresh_failed_status())
+    def _background_refresh(self, session):
+        if not self._do_refresh(True, session):
+            if session.resources:
+                self._set_status(self._refresh_failed_status(session), session, reauth=True)
+            else:
+                self._show("signin", session)
             return
-        try:
-            resources = af.enumerate_feed(self.token)
-        except Exception:
-            self._set_status("Showing saved workspaces (couldn't refresh)")
-            return
-        storage.save_ws_cache(resources, af.upn)
-        GLib.idle_add(self._populate, resources)
+        self._load_feed(session)
 
     def _is_dark(self):
         ov = os.environ.get("AVD_THEME", "").strip().lower()
@@ -240,15 +403,20 @@ class AvdApp(Gtk.Application):
         for prop in ("notify::gtk-application-prefer-dark-theme", "notify::gtk-theme-name"):
             st.connect(prop, self._apply_theme)
 
-        self.win = Gtk.ApplicationWindow(application=self, title=APP_NAME)
+        self.win = create(Gtk.ApplicationWindow, application=self, title=APP_NAME)
         self.win.add_css_class("avd")
         self.win.set_default_size(820, 600)
         self.win.connect("close-request", self._on_close_request)
+        self.win.connect("notify::is-active", self._on_window_active_changed)
+        outside = Gtk.GestureClick()
+        outside.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        outside.connect("pressed", self._on_menu_outside_pressed)
+        self.win.add_controller(outside)
 
         # ---- header bar: brand (left) · refresh + account (right) -----------
         hb = Gtk.HeaderBar()
         hb.add_css_class("avd-header")
-        hb.set_title_widget(Gtk.Label())     # blank the centered window title
+        hb.set_title_widget(create(Gtk.Label, ))     # blank the centered window title
         self.win.set_titlebar(hb)
 
         brand = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=11)
@@ -259,42 +427,44 @@ class AvdApp(Gtk.Application):
         mark.set_pixel_size(18); mark.add_css_class("mark"); mark.set_valign(Gtk.Align.CENTER)
         tbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         tbox.set_valign(Gtk.Align.CENTER)      # center the title block next to the logo
-        t1 = Gtk.Label(label="AVD Feed + Connect", xalign=0); t1.add_css_class("brand-title")
-        t2 = Gtk.Label(label="Azure Virtual Desktop · Windows 365", xalign=0)
+        t1 = create(Gtk.Label, label="AVD Feed + Connect", xalign=0); t1.add_css_class("brand-title")
+        t2 = create(Gtk.Label, label="Azure Virtual Desktop · Windows 365", xalign=0)
         t2.add_css_class("brand-sub")
         tbox.append(t1); tbox.append(t2)
         brand.append(mark); brand.append(tbox)
         brand.set_valign(Gtk.Align.CENTER)
         hb.pack_start(brand)
 
-        # account menu button (avatar + who + caret), opens the settings/sign-out popover
+        # account menu button (avatar + who + caret), opens the saved account list
         menu_btn = Gtk.MenuButton(); menu_btn.add_css_class("acct-btn")
         acctbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         # The avatar IS the label (a Gtk.Label centers its own text), sized/
         # tinted by the .avatar CSS — no box wrapper.
-        self._avatar_lbl = Gtk.Label(label="?"); self._avatar_lbl.add_css_class("avatar")
+        self._avatar_lbl = create(Gtk.Label, label="?"); self._avatar_lbl.add_css_class("avatar")
         self._avatar_lbl.set_valign(Gtk.Align.CENTER)
-        self._acct_who = Gtk.Label(label="Sign in"); self._acct_who.add_css_class("acct-who")
+        self._acct_who = create(Gtk.Label, label=tr("Sign in")); self._acct_who.add_css_class("acct-who")
         self._acct_who.set_ellipsize(3); self._acct_who.set_max_width_chars(24)
         caret = Gtk.Image.new_from_icon_name("pan-down-symbolic"); caret.add_css_class("caret")
         acctbox.append(self._avatar_lbl); acctbox.append(self._acct_who); acctbox.append(caret)
         menu_btn.set_child(acctbox)
 
-        pop = Gtk.Popover()
+        # Avoid an input grab that can deactivate the parent on touch input.
+        # Outside presses and parent deactivation dismiss these menus explicitly.
+        pop = Gtk.Popover(autohide=False)
         pbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         for m in ("top", "bottom", "start", "end"):
             getattr(pbox, f"set_margin_{m}")(6)
 
         # Appearance: System / Light / Dark (remembered), applied live.
-        appr = Gtk.Label(label="APPEARANCE", xalign=0); appr.add_css_class("menu-head")
+        appr = create(Gtk.Label, label=tr("APPEARANCE"), xalign=0); appr.add_css_class("menu-head")
         appr.set_margin_start(4); appr.set_margin_top(2)
         pbox.append(appr)
         seg = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, homogeneous=True)
         seg.add_css_class("linked"); seg.set_margin_bottom(4)
         cur_theme = self._settings.get("_theme") or "system"
         first = None
-        for key, label in (("system", "System"), ("light", "Light"), ("dark", "Dark")):
-            b = Gtk.ToggleButton(label=label)
+        for key, label in (("system", tr("System")), ("light", tr("Light")), ("dark", tr("Dark"))):
+            b = create(Gtk.ToggleButton, label=label)
             if first is None:
                 first = b
             else:
@@ -303,29 +473,76 @@ class AvdApp(Gtk.Application):
             b.connect("toggled", lambda btn, k=key: btn.get_active() and self._set_theme(k))
             seg.append(b)
         pbox.append(seg)
+        # Language lives in the Default settings dialog: a GtkDropDown opens its
+        # own popup, which fights this non-autohide popover's outside-click
+        # dismisser (the menu just closed on click). A real window has no such
+        # conflict and a dropdown scales to many languages. This row opens it.
+        language_btn = create(Gtk.Button, label=tr("Language…")); language_btn.add_css_class("flat")
+        language_btn.connect("clicked",
+                             lambda *_: (self._settings_pop.popdown(), self._open_settings(None)))
+        pbox.append(language_btn)
         pbox.append(Gtk.Separator())
 
         # System tray options (off by default, so closing still quits unless
         # asked). Insensitive until a tray host shows our icon.
-        trayh = Gtk.Label(label="SYSTEM TRAY", xalign=0); trayh.add_css_class("menu-head")
+        trayh = create(Gtk.Label, label=tr("SYSTEM TRAY"), xalign=0); trayh.add_css_class("menu-head")
         trayh.set_margin_start(4); trayh.set_margin_top(2)
         pbox.append(trayh)
-        for key, label in (("_close_to_tray", "Keep running in the tray when closed"),
-                           ("_start_in_tray", "Start in the tray")):
-            cb = Gtk.CheckButton(label=label)
+        for key, label in (("_close_to_tray", tr("Keep running in the tray when closed")),
+                           ("_start_in_tray", tr("Start in the tray"))):
+            cb = create(Gtk.CheckButton, label=label)
             cb.set_active(bool(self._settings.get(key)))
             cb.set_sensitive(False)
-            cb.set_tooltip_text("Needs a system tray on your desktop")
+            bind(cb, 'tooltip_text', tr("Needs a system tray on your desktop"))
             cb.connect("toggled", lambda btn, k=key: self._set_tray_option(k, btn.get_active()))
             pbox.append(cb)
             self._tray_toggles.append(cb)
         pbox.append(Gtk.Separator())
 
-        setbtn = Gtk.Button(label="Default settings…"); setbtn.add_css_class("flat")
-        setbtn.connect("clicked", lambda *_: (pop.popdown(), self._open_settings(None)))
+        setbtn = create(Gtk.Button, label=tr("Default settings…")); setbtn.add_css_class("flat")
+        setbtn.connect("clicked", lambda *_: (settings_pop.popdown(), self._open_settings(None)))
         pbox.append(setbtn)
+        settings_pop = pop
+        settings_pop.add_css_class("avd-menu")
+        self._settings_pop = settings_pop
+        settings_btn = Gtk.MenuButton(icon_name="emblem-system-symbolic")
+        settings_btn.add_css_class("iconbtn")
+        bind(settings_btn, 'tooltip_text', tr("Settings"))
+        settings_pop.set_child(pbox)
+        settings_btn.set_popover(settings_pop)
+        # Avoid an input grab that can deactivate the parent on touch input.
+        # Outside presses and parent deactivation dismiss these menus explicitly.
+        pop = Gtk.Popover(autohide=False)
+        self._account_pop = pop
+        pop.add_css_class("avd-menu")
+        pbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        for margin in ("top", "bottom", "start", "end"):
+            getattr(pbox, f"set_margin_{margin}")(6)
+        self._view_modes = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        self._view_modes.add_css_class("view-modes")
+        previous = None
+        self._view_buttons = {}
+        for mode, label in (("account", tr("By account")), ("all", tr("All accounts"))):
+            button = create(Gtk.ToggleButton, label=label, hexpand=True)
+            if previous:
+                button.set_group(previous)
+            button.set_active(self.view_mode == mode)
+            button.connect("toggled", lambda control, value=mode:
+                           self._set_view_mode(value) if control.get_active() else None)
+            self._view_buttons[mode] = button
+            self._view_modes.append(button)
+            previous = button
+        pbox.append(self._view_modes)
+        self._account_rows = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        pbox.append(self._account_rows)
+        self._account_separator = Gtk.Separator()
+        pbox.append(self._account_separator)
+        add = create(Gtk.Button, label=tr("Add account"))
+        add.add_css_class("flat")
+        add.connect("clicked", lambda *_: (pop.popdown(), self._add_account()))
+        pbox.append(add)
         pbox.append(Gtk.Separator())
-        signout = Gtk.Button(label="Sign out"); signout.add_css_class("flat")
+        signout = create(Gtk.Button, label=tr("Sign out")); signout.add_css_class("flat")
         signout.set_sensitive(False)
         signout.connect("clicked", lambda *_: (pop.popdown(), self._sign_out()))
         self._signout_item = signout
@@ -335,10 +552,12 @@ class AvdApp(Gtk.Application):
 
         self.refresh_btn = Gtk.Button.new_from_icon_name("view-refresh-symbolic")
         self.refresh_btn.add_css_class("iconbtn")
-        self.refresh_btn.set_tooltip_text("Refresh workspaces")
+        bind(self.refresh_btn, 'tooltip_text', tr("Refresh workspaces"))
         self.refresh_btn.connect("clicked", lambda *_: self._reload_feed())
 
         hb.pack_end(menu_btn)
+        hb.pack_end(settings_btn)
+        self._rebuild_account_menu()
         hb.pack_end(self.refresh_btn)
 
         self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
@@ -351,15 +570,15 @@ class AvdApp(Gtk.Application):
         signin.set_valign(Gtk.Align.CENTER); signin.set_halign(Gtk.Align.CENTER)
         bm = Gtk.Image.new_from_icon_name("computer-symbolic"); bm.set_pixel_size(32)
         bm.add_css_class("bigmark"); bm.set_margin_bottom(14); bm.set_halign(Gtk.Align.CENTER)
-        h1 = Gtk.Label(label="Sign in to your workspaces"); h1.add_css_class("hero-title")
-        h2 = Gtk.Label(label="Connect your Microsoft work account to see the desktops "
-                             "and apps you're entitled to.")
+        h1 = create(Gtk.Label, label=tr("Sign in to your workspaces")); h1.add_css_class("hero-title")
+        h2 = create(Gtk.Label, label=tr("Connect your Microsoft work account to see the desktops "
+                             "and apps you're entitled to."))
         h2.add_css_class("hero-sub"); h2.set_wrap(True); h2.set_justify(Gtk.Justification.CENTER)
         h2.set_max_width_chars(38); h2.set_margin_top(4)
-        btn = Gtk.Button(label="Sign in with Microsoft"); btn.add_css_class("msbtn")
+        btn = create(Gtk.Button, label=tr("Sign in with Microsoft")); btn.add_css_class("msbtn")
         btn.set_halign(Gtk.Align.CENTER); btn.set_margin_top(20)
         btn.connect("clicked", lambda *_: self._interactive_signin())
-        note = Gtk.Label(label="Unofficial client · not affiliated with or endorsed by Microsoft")
+        note = create(Gtk.Label, label=tr("Unofficial client · not affiliated with or endorsed by Microsoft"))
         note.add_css_class("hero-note"); note.set_margin_top(24)
         for w in (bm, h1, h2, btn, note):
             signin.append(w)
@@ -372,9 +591,9 @@ class AvdApp(Gtk.Application):
         head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         for m, v in (("top", 18), ("start", 22), ("end", 22), ("bottom", 4)):
             getattr(head, f"set_margin_{m}")(v)
-        sh = Gtk.Label(label="YOUR WORKSPACES", xalign=0); sh.add_css_class("section-h")
+        sh = create(Gtk.Label, label=tr("YOUR WORKSPACES"), xalign=0); sh.add_css_class("section-h")
         sh.set_hexpand(True)
-        self._count_lbl = Gtk.Label(label="", xalign=1); self._count_lbl.add_css_class("count")
+        self._count_lbl = create(Gtk.Label, label="", xalign=1); self._count_lbl.add_css_class("count")
         head.append(sh); head.append(self._count_lbl)
         wp.append(head)
 
@@ -388,7 +607,9 @@ class AvdApp(Gtk.Application):
         self.grid.set_margin_top(8); self.grid.set_margin_bottom(18)
         self.grid.set_margin_start(22); self.grid.set_margin_end(22)
         self.grid.connect("child-activated", self._on_tile_activated)
-        sw.set_child(self.grid)
+        self._resource_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, valign=Gtk.Align.START)
+        self._resource_box.append(self.grid)
+        sw.set_child(self._resource_box)
 
         # Connecting overlay: centered spinner card shown while a session is
         # establishing (silent AAD + RDP handshake), until the desktop logs on.
@@ -399,11 +620,17 @@ class AvdApp(Gtk.Application):
         cbox.set_halign(Gtk.Align.CENTER); cbox.set_valign(Gtk.Align.CENTER)
         cbox.add_css_class("connect-card")
         self._connect_spinner = Gtk.Spinner(); self._connect_spinner.set_size_request(42, 42)
-        self._connect_label = Gtk.Label(label="Connecting…"); self._connect_label.add_css_class("connect-label")
-        csub = Gtk.Label(label="Securing your session"); csub.add_css_class("connect-sub")
+        self._connect_label = create(Gtk.Label, label=tr("Connecting…")); self._connect_label.add_css_class("connect-label")
+        csub = create(Gtk.Label, label=tr("Securing your session")); csub.add_css_class("connect-sub")
         cbox.append(self._connect_spinner); cbox.append(self._connect_label); cbox.append(csub)
         cbox.set_visible(False)
-        cbox.set_can_target(False)
+        cancel_connect = Gtk.Button.new_from_icon_name("window-close-symbolic")
+        bind(cancel_connect, 'tooltip_text', tr("Cancel pending connections"))
+        cancel_connect.set_halign(Gtk.Align.END)
+        cancel_connect.add_css_class("flat")
+        cancel_connect.connect("clicked", lambda *_: self._cancel_visible_connections())
+        cbox.prepend(cancel_connect)
+        cbox.set_can_target(True)
         self._connect_overlay = cbox
         overlay.add_overlay(cbox)
         wp.append(overlay)
@@ -413,9 +640,9 @@ class AvdApp(Gtk.Application):
         foot.add_css_class("foot")
         self._livedot = Gtk.Box(); self._livedot.add_css_class("livedot")
         self._livedot.set_valign(Gtk.Align.CENTER)
-        self.status = Gtk.Label(label="", xalign=0); self.status.add_css_class("status")
+        self.status = create(Gtk.Label, label="", xalign=0); self.status.add_css_class("status")
         self.status.set_hexpand(True)
-        ver = Gtk.Label(label="v" + APP_VERSION, xalign=1); ver.add_css_class("ver")
+        ver = create(Gtk.Label, label="v" + APP_VERSION, xalign=1); ver.add_css_class("ver")
         foot.append(self._livedot); foot.append(self.status); foot.append(ver)
         wp.append(foot)
         self.stack.add_named(wp, "workspaces")
@@ -426,38 +653,83 @@ class AvdApp(Gtk.Application):
         busy.set_valign(Gtk.Align.CENTER)
         sp = Gtk.Spinner(); sp.start()
         busy.append(sp)
-        busy.append(Gtk.Label(label="Loading…"))
+        busy.append(create(Gtk.Label, label=tr("Loading…")))
         self.stack.add_named(busy, "busy")
         self.stack.set_visible_child_name("busy")
 
     # ---- helpers (main thread) --------------------------------------------
-    def _set_status(self, text):
-        GLib.idle_add(lambda: self.status.set_text(text) if self.status else None)
+    def _dismiss_menus(self):
+        for name in ("_account_pop", "_settings_pop"):
+            popover = getattr(self, name, None)
+            if popover is not None:
+                popover.popdown()
+
+    def _on_menu_outside_pressed(self, _gesture, _count, x, y):
+        target = self.win.pick(x, y, Gtk.PickFlags.DEFAULT)
+        while target is not None:
+            # Let menu items and the menu buttons handle their own interaction.
+            if isinstance(target, (Gtk.Popover, Gtk.MenuButton)):
+                return
+            target = target.get_parent()
+        self._dismiss_menus()
+
+    def _on_window_active_changed(self, window, _property):
+        """Dismiss menus when their non-grabbing parent loses activation."""
+        if not window.is_active():
+            self._dismiss_menus()
+
+    def _set_status(self, text, session=None, reauth=False, attempt=None, allow_cancelled=False):
+        def apply():
+            if attempt is not None and (not attempt.is_current()
+                    or (attempt.cancelled.is_set() and not allow_cancelled)):
+                return False
+            if session is not None:
+                session.view_status = text
+                session.needs_signin = reauth
+                if self.view_mode == "all" and not session.removed:
+                    widgets = self._account_status_widgets.get(session.id)
+                    if widgets:
+                        bind(widgets[0], 'text', text)
+                        widgets[0].get_parent().set_visible(bool(text) or reauth)
+                        widgets[1].set_visible(reauth)
+                    return False
+            if self.status and (session is None or self._visible(session)):
+                bind(self.status, 'text', text)
+            return False
+        GLib.idle_add(apply)
 
     def _update_account(self, who):
         """Fill the header account chip: email + a 2-letter avatar."""
         if not who or "@" not in who:
-            self._acct_who.set_text("Sign in")
-            self._avatar_lbl.set_text("?")
+            bind(self._acct_who, 'text', tr("Sign in"))
+            bind(self._avatar_lbl, 'text', "?")
             return
-        self._acct_who.set_text(who)
+        bind(self._acct_who, 'text', self.current.display_name if self.current else who)
         user = who.split("@", 1)[0]
         parts = _re.split(r"[.\-_]+", user)
         initials = (parts[0][:1] + (parts[1][:1] if len(parts) > 1 else user[1:2]))
-        self._avatar_lbl.set_text(initials.upper() or "?")
+        bind(self._avatar_lbl, 'text', initials.upper() or "?")
 
-    def _set_connecting(self, res_id, title, on):
+    def _set_connecting(self, res_id, title, on, session=None, attempt=None, allow_cancelled=False):
         """Show/hide the centered 'Connecting…' spinner overlay. Safe to call
         from any thread. The overlay stays up while any session is connecting."""
+        session = session or self.current
+        if session is None:
+            return
+        key = (session.id, res_id)
         def apply():
-            if on:
-                self._connecting.add(res_id)
+            if attempt is not None and (not attempt.is_current()
+                    or (attempt.cancelled.is_set() and not allow_cancelled)):
+                return False
+            if on and not session.removed:
+                self._connecting.add(key)
             else:
-                self._connecting.discard(res_id)
-            if self._connecting:
-                n = len(self._connecting)
-                self._connect_label.set_text(
-                    f"Connecting to {title}…" if n == 1 else f"Connecting… ({n})")
+                self._connecting.discard(key)
+            visible = [key for key in self._connecting if self.view_mode == "all" or key[0] == self.selected_id]
+            if visible:
+                n = len(visible)
+                bind(self._connect_label, 'text',
+                    tr("Connecting to {resource}…").format(resource=title) if n == 1 else tr("Connecting… ({count})").format(count=n))
                 self._connect_spinner.start()
                 self._connect_overlay.set_visible(True)
             else:
@@ -466,83 +738,68 @@ class AvdApp(Gtk.Application):
             return False
         GLib.idle_add(apply)
 
-    def _show(self, name):
+    def _show(self, name, session=None):
         def apply():
+            if session is not None and not self._visible(session):
+                return False
+            if self.view_mode == "all" and session is not None:
+                if name == "signin":
+                    session.view_status = "Sign in again to refresh"
+                    session.needs_signin = True
+                self._render_resources(session)
+                return False
             self.stack.set_visible_child_name(name)
             # "Sign out" only makes sense once we're signed in (workspaces view)
             if self._signout_item is not None:
-                self._signout_item.set_sensitive(name == "workspaces")
+                self._signout_item.set_sensitive(self.current is not None)
         GLib.idle_add(apply)
 
     # ---- auth / token lifecycle ------------------------------------------
-    def _apply_token(self, tok):
-        """Store a freshly minted token, persist the (rotated) refresh token,
-        and schedule a silent refresh before it expires."""
-        with self._token_lock:
-            self.token = tok["access_token"]
-            self._deadline = time.monotonic() + int(tok.get("expires_in", 3600))
-        af.set_upn_from_token(tok)  # learn the account for /u: and the status bar
-        rt = tok.get("refresh_token")
-        if rt:
-            af.save_refresh_token(rt)
-        # refresh 5 min before expiry (min 60s out)
-        secs = max(60, int(tok.get("expires_in", 3600)) - 300)
-        GLib.idle_add(self._schedule_refresh, secs)
-
-    def _schedule_refresh(self, secs):
-        if self._refresh_source:
-            GLib.source_remove(self._refresh_source)
-        self._refresh_source = GLib.timeout_add_seconds(secs, self._auto_refresh)
+    def _schedule_refresh(self, session):
+        if session.removed:
+            return False
+        if session.refresh_source:
+            GLib.source_remove(session.refresh_source)
+        secs = max(60, int(session.deadline - time.monotonic()) - 300)
+        session.refresh_source = GLib.timeout_add_seconds(secs, self._auto_refresh, session)
         return False
 
-    def _auto_refresh(self):
-        self._refresh_source = 0
-        threading.Thread(target=self._do_refresh, args=(True,), daemon=True).start()
-        return False  # one-shot; _apply_token reschedules the next one
+    def _auto_refresh(self, session):
+        session.refresh_source = 0
+        threading.Thread(target=self._do_refresh, args=(True, session), daemon=True).start()
+        return False
 
-    def _do_refresh(self, silent):
-        """Run the refresh_token grant; returns True on success."""
-        rec = af.load_token_record()
-        rt = rec.get("refresh_token") if rec else None
-        if not rt:
-            if not silent:
-                self._show("signin")
-            return False
-        tok = af.oauth._refresh(rt)
-        if not tok:
-            if not silent:
-                self._error("Session expired — please sign in again.")
-                self._show("signin")
-            return False
-        self._apply_token(tok)
-        return True
-
-    def _ensure_token(self):
-        """Called from worker threads before a feed/rdp request; refreshes
-        synchronously if the token is within 2 min of expiry."""
-        with self._token_lock:
-            fresh = self.token and time.monotonic() < self._deadline - 120
-        if fresh:
+    def _do_refresh(self, silent, session):
+        if session.refresh():
+            GLib.idle_add(self._save_refreshed_profile, session)
+            GLib.idle_add(self._schedule_refresh, session)
             return True
-        return self._do_refresh(silent=True)
+        if not silent:
+            self._show("signin", session)
+        return False
 
-    def _silent_signin(self):
-        if af.has_token() and self._do_refresh(silent=True):
-            self._load_feed_bg()
-            return
-        self._show("signin")
+    def _save_refreshed_profile(self, session):
+        if not session.removed:
+            self.registry.save()
+            self._rebuild_account_menu()
+        return False
 
-    def _refresh_failed_status(self):
-        """Status-bar text for a failed silent refresh, naming the real cause
-        when it's the tenant's Conditional Access sign-in-frequency policy
-        (AADSTS70043) rather than anything the app can fix."""
-        err = af.last_refresh_error
+    def _ensure_token(self, session):
+        with session.refresh_lock:
+            if session.removed:
+                return False
+            if session.token and time.monotonic() < session.deadline - 120:
+                return True
+        return self._do_refresh(True, session)
+
+    def _refresh_failed_status(self, session):
+        err = session.client.last_refresh_error
         if "AADSTS70043" in err or "sign-in frequency" in err:
-            return ("Showing saved workspaces · your organization requires signing "
-                    "in again (Conditional Access sign-in frequency)")
-        return "Showing saved workspaces · sign in again to refresh"
+            return (tr("Showing saved workspaces · your organization requires signing "
+                    "in again (Conditional Access sign-in frequency)"))
+        return tr("Showing saved workspaces · sign in again to refresh")
 
-    def _web_session(self):
+    def _web_session(self, session):
         """Shared, PERSISTENT WebKit network session used by every Microsoft
         sign-in webview — the launcher's sign-in dialog and the connection-time
         AAD resolver. It only ever visits Entra login domains, so persisting its
@@ -551,20 +808,26 @@ class AvdApp(Gtk.Application):
         connection-time gateway token be fetched silently from the same SSO
         session. Stored in our app data dir (user-private); the refresh token
         itself lives in the keyring, not here."""
-        if self._web_session_obj is None:
-            d = os.path.join(os.path.dirname(config.CACHE), "webview")
-            os.makedirs(d, exist_ok=True)
-            self._web_session_obj = WebKit.NetworkSession.new(
+        if session.web_session is None:
+            d = os.path.join(session.directory, "webview")
+            os.makedirs(d, mode=0o700, exist_ok=True)
+            session.web_session = WebKit.NetworkSession.new(
                 d, os.path.join(d, "cache"))
             try:
-                self._web_session_obj.get_cookie_manager().set_persistent_storage(
+                session.web_session.get_cookie_manager().set_persistent_storage(
                     os.path.join(d, "cookies.sqlite"),
                     WebKit.CookiePersistentStorage.SQLITE)
             except Exception:
                 pass
-        return self._web_session_obj
+        return session.web_session
 
-    def _interactive_signin(self):
+    def _interactive_signin(self, session=None):
+        session = session or self.current
+        if session is None:
+            self._add_account()
+            return
+        if session.removed:
+            return
         # Never reuse or resume a previous sign-in window: tear any existing one
         # down and start fresh, so closing and reopening is always a clean slate
         # (the user's rule: close must close, reopen must resume from clean).
@@ -588,15 +851,15 @@ class AvdApp(Gtk.Application):
             "code_challenge": challenge, "code_challenge_method": "S256",
             "state": state, "prompt": "select_account",
         }
-        if af.upn:
-            params["login_hint"] = af.upn   # preselect the known account in the picker
+        if session.client.upn:
+            params["login_hint"] = session.client.upn   # preselect the known account in the picker
         url = config.LOGIN + "/authorize?" + urllib.parse.urlencode(params)
 
         # With the main window hidden in the tray (e.g. a tray-initiated
         # connect), show the sign-in on its own instead of surfacing the app:
         # a standalone top-level, since a modal dialog needs a visible parent.
         parent = self.win if self.win and self.win.get_visible() else None
-        dlg = Gtk.Window(title="Sign in", transient_for=parent, modal=parent is not None)
+        dlg = create(Gtk.Window, title=tr("Sign in"), transient_for=parent, modal=parent is not None)
         dlg.set_default_size(520, 640)
         # Shared PERSISTENT session (SSO cookies kept on disk) so a re-auth is a
         # click-through and the connection-time token can be fetched silently.
@@ -604,7 +867,8 @@ class AvdApp(Gtk.Application):
         # ephemeral session are fixed independently (popup blocking + explicit
         # close-request + always destroying/rebuilding the dialog + DMABUF off),
         # so persistence is safe and is what actually reduces sign-in prompts.
-        wv = WebKit.WebView(network_session=self._web_session())
+        wv = WebKit.WebView(network_session=self._web_session(session))
+        self._apply_ua(wv)   # account sign-in → Default UA (issue #28)
         dlg.set_child(wv)
         self._signin_dlg = dlg
         got_code = [False]
@@ -621,7 +885,8 @@ class AvdApp(Gtk.Application):
             if self._signin_dlg is dlg:
                 self._signin_dlg = None
             if not got_code[0]:
-                self._pending_launch = None   # user gave up; don't auto-connect later
+                session.pending_launch = None
+                self._discard_add(session)
         dlg.connect("destroy", on_closed)
         # Default close-request already destroys the window; make it explicit and
         # unconditional so nothing can swallow the close.
@@ -637,12 +902,13 @@ class AvdApp(Gtk.Application):
                 got_code[0] = True
                 dlg.destroy()
                 if qs.get("state", [state])[0] != state:
-                    self._pending_launch = None
-                    self._error("Sign-in state mismatch, please retry.")
+                    session.pending_launch = None
+                    self._discard_add(session)
+                    self._error(tr("Sign-in state mismatch, please retry."))
                     return True
                 code = qs.get("code", [""])[0]
-                self._show("busy")
-                threading.Thread(target=self._exchange, args=(code, verifier),
+                self._show("busy", session)
+                threading.Thread(target=self._exchange, args=(code, verifier, session),
                                  daemon=True).start()
                 return True
             return False
@@ -651,112 +917,261 @@ class AvdApp(Gtk.Application):
         wv.load_uri(url)
         dlg.present()
 
-    def _exchange(self, code, verifier):
-        st, tok = http.post(config.LOGIN + "/token", {
-            "grant_type": "authorization_code", "client_id": config.CLIENT_ID,
-            "code": code, "redirect_uri": config.REDIRECT, "scope": config.SCOPE,
-            "code_verifier": verifier})
-        if st != 200:
-            self._pending_launch = None
-            self._error("Sign-in failed: " + tok.get("error_description", tok.get("error", "?")))
-            self._show("signin")
+    def _exchange(self, code, verifier, session):
+        try:
+            st, tok = http.post(config.LOGIN + "/token", {
+                "grant_type": "authorization_code", "client_id": config.CLIENT_ID,
+                "code": code, "redirect_uri": config.REDIRECT, "scope": config.SCOPE,
+                "code_verifier": verifier})
+            if st != 200:
+                raise ValueError(tok.get("error_description", tok.get("error", tr("Sign-in failed"))))
+            claims_from_token(tok)
+        except Exception as error:
+            GLib.idle_add(self._signin_failed, session, str(error))
             return
-        self._apply_token(tok)
-        self._load_feed_bg()   # _populate then auto-connects any pending workspace
+        GLib.idle_add(self._finish_signin, session, tok)
+
+    def _signin_failed(self, session, message):
+        session.pending_launch = None
+        self._discard_add(session)
+        self._error(tr("Sign-in failed: {error}").format(error=message))
+        if self._visible(session):
+            self._show("workspaces" if session.resources else "signin", session)
+        return False
+
+    def _finish_signin(self, session, tok):
+        if session.removed:
+            return False
+        try:
+            claims = claims_from_token(tok)
+            if session is self._adding:
+                existing = next((s for s in self.accounts.values() if not s.removed and
+                                 (s.profile['tid'], s.profile['oid']) == (claims['tid'], claims['oid'])), None)
+                target = existing or session
+                if not target.apply_token(tok):
+                    raise ValueError(tr("Please use the selected work account."))
+                profile = self.registry.upsert(claims, target.id)
+                target.profile = profile
+                if existing:
+                    self._discard_add(session)
+                else:
+                    self._adding = None
+                    self.accounts[target.id] = target
+                session = target
+            else:
+                if not session.apply_token(tok):
+                    raise ValueError(tr("Please sign in with the selected work account."))
+                self.registry.save()
+            self._schedule_refresh(session)
+            self._select_account(session.id)
+        except (ValueError, OSError) as error:
+            self._signin_failed(session, str(error))
+        return False
 
     def _sign_out(self):
-        # Manual sign-out is the ONLY thing that clears the session + workspaces.
-        af.clear_token_cache()            # keyring entry + any fallback file
-        try:
-            if os.path.exists(storage.WS_CACHE):
-                os.remove(storage.WS_CACHE)
-        except OSError:
-            pass
-        shutil.rmtree(storage.ICON_DIR, ignore_errors=True)
-        # Forget the persisted Microsoft SSO cookies too, so sign-out is total
-        # (next sign-in is a fresh password+MFA, not a cookie click-through).
-        self._web_session_obj = None
-        shutil.rmtree(os.path.join(os.path.dirname(config.CACHE), "webview"),
-                      ignore_errors=True)
-        self._pending_launch = None
-        af.upn = "" if not os.environ.get("AVD_UPN") else af.upn
-        with self._token_lock:
-            self.token = None
-            self._deadline = 0.0
-        if self._refresh_source:
-            GLib.source_remove(self._refresh_source)
-            self._refresh_source = 0
+        session = self.current
+        if session is None:
+            return
+        session.close()
+        if session.refresh_source:
+            GLib.source_remove(session.refresh_source)
+            session.refresh_source = 0
+        self.registry.remove(session.id)
+        if session.web_session is not None:
+            session.web_session.get_website_data_manager().clear(
+                WebKit.WebsiteDataTypes.ALL, 0, None, None, None)
+            session.web_session = None
+        shutil.rmtree(session.directory, ignore_errors=True)
+        self.selected_id = self.registry.selected_id
         self._clear_tiles()
-        self._show("signin")
+        self._rebuild_account_menu()
+        if self.current:
+            self._select_account(self.selected_id)
+        else:
+            self._update_account("")
+            self._show("signin")
+            self._set_connecting("", "", False, session)
 
-    # ---- feed -------------------------------------------------------------
     def _reload_feed(self):
-        if not self.token:
-            self._interactive_signin()   # e.g. saved view whose refresh was refused
+        if self.view_mode == "all":
+            for owner in self.accounts.values():
+                if not owner.removed:
+                    threading.Thread(target=self._background_refresh, args=(owner,), daemon=True).start()
             return
-        self._show("busy")
-        self._load_feed_bg()
+        session = self.current
+        if not session or not session.token:
+            self._interactive_signin(session)
+            return
+        self._load_feed_bg(session)
 
-    def _load_feed_bg(self):
-        self._show("busy")
-        threading.Thread(target=self._load_feed, daemon=True).start()
+    def _load_feed_bg(self, session):
+        self._show("busy", session)
+        threading.Thread(target=self._load_feed, args=(session,), daemon=True).start()
 
-    def _load_feed(self):
-        cached, cached_upn = storage.load_ws_cache()
-        if cached_upn and not af.upn:
-            af.upn = cached_upn
-        have_cache = bool(cached)
-        if not self._ensure_token():
-            if not have_cache:
-                self._show("signin")
+    def _load_feed(self, session):
+        if not self._ensure_token(session):
+            self._set_status(self._refresh_failed_status(session), session, reauth=True)
+            if not session.resources:
+                self._show("signin", session)
             return
         try:
-            resources = af.enumerate_feed(self.token)
-        except Exception as e:
-            # Keep whatever is on screen if we have a cached list; only a first
-            # run with nothing to show falls back to the sign-in page.
-            self._pending_launch = None
-            if have_cache:
-                self._set_status("Couldn't refresh workspaces — showing saved list")
+            resources = session.client.enumerate_feed(session.token)
+        except Exception as error:
+            session.pending_launch = None
+            if session.resources:
+                self._show("workspaces", session)
+                self._set_status(tr("Couldn't refresh workspaces — showing saved list"), session)
             else:
-                self._error("Feed error: " + str(e)); self._show("signin")
+                self._show("signin", session)
+                if self.view_mode != "all" and self._visible(session):
+                    self._error(tr("Feed error: {error}").format(error=str(error)))
             return
-        storage.save_ws_cache(resources, af.upn)
-        GLib.idle_add(self._populate, resources)
+        if session.save_resources(resources):
+            GLib.idle_add(self._populate, resources, session)
+
+    def _set_view_mode(self, mode):
+        if mode not in ("account", "all") or self.view_mode == mode:
+            return
+        self.view_mode = mode
+        self._settings["_account_view"] = mode
+        storage.save_settings(self._settings)
+        self._render_resources()
+        self._set_connecting("", "", False)
+        if mode == "all":
+            self._reload_feed()
 
     def _clear_tiles(self):
-        for ch in self._tiles:
-            self.grid.remove(ch)
+        for child in self._tiles:
+            parent = child.get_parent()
+            if parent:
+                parent.remove(child)
         self._tiles = []
+        child = self._resource_box.get_first_child()
+        while child:
+            self._resource_box.remove(child)
+            child = self._resource_box.get_first_child()
+        self._account_sections = {}
         self._tray_refresh()
 
-    def _populate(self, resources):
-        self._clear_tiles()
-        for res in resources:
-            ch = self._make_tile(res)
-            self.grid.append(ch)
-            self._tiles.append(ch)
-        who = af.upn or "your account"
-        self.status.set_text(f"Signed in as {who}")
-        n = len(resources)
-        self._count_lbl.set_text(f"{n} resource" + ("" if n == 1 else "s"))
-        self._update_account(who)
+    def _render_resources(self, session=None):
+        partial = self.view_mode == "all" and session is not None and session.id in self._account_sections
+        if partial:
+            section = self._account_sections.pop(session.id)
+            previous = section.get_prev_sibling()
+            for child in self._tiles:
+                if child._account is session:
+                    child.get_parent().remove(child)
+            self._tiles = [child for child in self._tiles if child._account is not session]
+            self._resource_box.remove(section)
+        else:
+            self._clear_tiles()
+            self._account_status_widgets = {}
+        owners = ([owner for owner in self.accounts.values() if not owner.removed]
+                  if self.view_mode == "all" else ([self.current] if self.current else []))
+        for owner in ([session] if partial else owners):
+            section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+            if partial:
+                self._resource_box.insert_child_after(section, previous)
+            else:
+                self._resource_box.append(section)
+            self._account_sections[owner.id] = section
+            owner._rendered_resources = [dict(resource) for resource in owner.resources]
+            if self.view_mode == "all":
+                heading = Gtk.Label(label=owner.display_name + " · " + owner.client.upn, xalign=0,
+                                    margin_start=22, margin_end=22, wrap=True)
+                heading.add_css_class("tname")
+                section.append(heading)
+                message = getattr(owner, "view_status", "")
+                row = Gtk.Box(spacing=12, margin_start=22, margin_end=22)
+                status_label = Gtk.Label(label=message or ("No resources available" if not owner.resources else ""), xalign=0, wrap=True)
+                status_label.add_css_class("status")
+                row.append(status_label)
+                signin = Gtk.Button(label="Sign in")
+                signin.add_css_class("flat")
+                signin.connect("clicked", lambda *_, session=owner: self._interactive_signin(session))
+                signin.set_visible(getattr(owner, "needs_signin", False))
+                row.append(signin)
+                self._account_status_widgets[owner.id] = (status_label, signin)
+                row.set_visible(bool(message) or not owner.resources)
+                section.append(row)
+            groups = {}
+            for resource in owner.resources:
+                groups.setdefault((resource.get("tenant_id", ""), resource.get("tenant") or "Workspace"), []).append(resource)
+            if self.view_mode != "all":
+                groups = {("", ""): owner.resources}
+            for (_, workspace), resources in groups.items():
+                if workspace:
+                    label = Gtk.Label(label=workspace, xalign=0, margin_start=22, wrap=True)
+                    label.add_css_class("status")
+                    section.append(label)
+                grid = Gtk.FlowBox(valign=Gtk.Align.START, max_children_per_line=5,
+                                   min_children_per_line=2, row_spacing=14, column_spacing=14,
+                                   homogeneous=True, selection_mode=Gtk.SelectionMode.NONE,
+                                   margin_top=8, margin_bottom=18, margin_start=22, margin_end=22)
+                grid.connect("child-activated", self._on_tile_activated)
+                section.append(grid)
+                self.grid = grid
+                for res in resources:
+                    child = owner.tiles.get(res["id"])
+                    if child is None:
+                        child = self._make_tile(res, owner)
+                        owner.tiles[res["id"]] = child
+                    child._res = res
+                    grid.append(child)
+                    self._tiles.append(child)
+        count = len(self._tiles)
+        bind(self._count_lbl, 'text',
+             ngettext("{count} resource", "{count} resources", count).format(count=count))
+        bind(self.status, 'text',
+             tr("All accounts") if self.view_mode == "all"
+             else tr("Signed in as {upn}").format(upn=self.current.client.upn) if self.current
+             else "")
+        self._update_account(self.current.client.upn if self.current else "")
+        self._rebuild_account_menu()
         self._tray_refresh()
-        self.stack.set_visible_child_name("workspaces")
-        if self._signout_item is not None:
-            self._signout_item.set_sensitive(True)
-        # Icons: cached PNGs show immediately; with a token they're re-fetched
-        # (and re-cached) in the background so the grid never looks "reset".
-        threading.Thread(target=self._load_icons, args=(resources,),
-                         daemon=True).start()
-        # A connect that had to wait for sign-in resumes now, on the fresh tiles
-        pending, self._pending_launch = self._pending_launch, None
+        self.stack.set_visible_child_name("workspaces" if owners else "signin")
+        self._signout_item.set_sensitive(self.current is not None)
+
+    def _populate(self, resources, session=None):
+        session = session or self.current
+        if session is None or session.removed:
+            return False
+        changed = (session.id not in self._account_sections or
+                   getattr(session, "_rendered_resources", None) != resources)
+        session.resources = resources
+        session.view_status = ""
+        session.needs_signin = False
+        if self._visible(session):
+            if changed:
+                self._render_resources(session)
+            else:
+                widgets = self._account_status_widgets.get(session.id)
+                if widgets:
+                    widgets[0].set_text("" if resources else "No resources available")
+                    widgets[1].set_visible(False)
+                    widgets[0].get_parent().set_visible(not resources)
+                self.stack.set_visible_child_name("workspaces")
+                self.status.set_text("All accounts" if self.view_mode == "all" else
+                                     f"Signed in as {session.client.upn}")
+        else:
+            self._rebuild_account_menu()
+            self._tray_refresh()
+        icon_resources = resources
+        if getattr(session, "_icon_resources", None) == resources:
+            icon_resources = [res for res in resources if res.get("icon32") and
+                              not os.path.isfile(storage.icon_path(res["id"], session.directory))]
+        if icon_resources:
+            session._icon_resources = [dict(resource) for resource in resources]
+            tiles = [session.tiles[res["id"]] for res in icon_resources if res["id"] in session.tiles]
+            threading.Thread(target=self._load_icons, args=(icon_resources, session, tiles), daemon=True).start()
+        pending, session.pending_launch = session.pending_launch, None
         if pending:
-            ch = self._child_for(pending[0])
-            if ch:
-                self._on_tile_activated(self.grid, ch, windowed=pending[1])
+            child = self._child_for(pending[0], session)
+            if child:
+                self._on_tile_activated(self.grid, child, windowed=pending[1])
+        return False
 
-    def _make_tile(self, res):
+    def _make_tile(self, res, session):
         is_desktop = res["type"] == "Desktop"
         tile = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=13)
         tile.add_css_class("tile")
@@ -773,7 +1188,7 @@ class AvdApp(Gtk.Application):
         img.set_hexpand(True); img.set_vexpand(True)
         img.set_halign(Gtk.Align.CENTER); img.set_valign(Gtk.Align.CENTER)
         ic.append(img)
-        pill = Gtk.Label(label="")
+        pill = create(Gtk.Label, label="")
         pill.add_css_class("status-pill")
         pill.set_valign(Gtk.Align.START)
         pill.set_visible(False)
@@ -782,7 +1197,7 @@ class AvdApp(Gtk.Application):
 
         # meta: title + type chip
         meta = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7)
-        title = Gtk.Label(label=res["title"], xalign=0); title.add_css_class("tname")
+        title = create(Gtk.Label, label=res["title"], xalign=0); title.add_css_class("tname")
         title.set_wrap(True); title.set_max_width_chars(18); title.set_lines(2)
         title.set_ellipsize(3)
         chip = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
@@ -790,7 +1205,7 @@ class AvdApp(Gtk.Application):
             chip.add_css_class("chip-app")
         chip.set_halign(Gtk.Align.START)
         dot = Gtk.Box(); dot.add_css_class("chipdot"); dot.set_valign(Gtk.Align.CENTER)
-        clabel = Gtk.Label(label="DESKTOP" if is_desktop else "REMOTE APP")
+        clabel = create(Gtk.Label, label=tr("DESKTOP") if is_desktop else tr("REMOTE APP"))
         clabel.add_css_class("chiplabel")
         chip.append(dot); chip.append(clabel)
         meta.append(title); meta.append(chip)
@@ -799,69 +1214,84 @@ class AvdApp(Gtk.Application):
 
         child = Gtk.FlowBoxChild()
         child.set_child(tile)
+        child._account = session
         child._res = res
         child._img = img
+        try:
+            img.set_from_paintable(Gdk.Texture.new_from_filename(storage.icon_path(res["id"], session.directory)))
+        except GLib.Error:
+            pass
         child._tile = tile
         child._pill = pill
         child._proc = None
         child._launching = False
-        child.set_tooltip_text(
-            f"{res['title']} — {res['tenant']}\nDouble-click to connect · "
-            f"right-click for this workspace's settings")
+        bind(child, 'tooltip_text',
+            tr("{resource} — {workspace}\nDouble-click to connect · right-click for this workspace's settings").format(
+                resource=res["title"], workspace=res["tenant"]))
         rclick = Gtk.GestureClick()
         rclick.set_button(3)
-        rclick.connect("pressed", lambda g, n, x, y, r=res: self._open_settings(r))
+        rclick.connect("pressed", lambda g, n, x, y, r=res: self._open_settings(r, session))
         child.add_controller(rclick)
         return child
 
-    def _child_for(self, res_id):
-        for c in self._tiles:
-            if getattr(c, "_res", {}).get("id") == res_id:
-                return c
-        return None
+    def _child_for(self, res_id, session=None):
+        session = session or self.current
+        return session.tiles.get(res_id) if session else None
 
-    def _set_tile_state(self, res_id, text, css):
+    def _set_tile_state(self, res_id, css, session=None, attempt=None, allow_cancelled=False):
+        session = session or self.current
+        if session is None:
+            return
+        key = (session.id, res_id)
         # Render session state as a corner pill: amber "Connecting", green
         # "Connected", hidden when idle. (css: state-connecting/connected/ended)
         def apply():
+            if attempt is not None and (not attempt.is_current()
+                    or (attempt.cancelled.is_set() and not allow_cancelled)):
+                return False
             if css in ("state-connecting", "state-connected"):
-                self._sessions[res_id] = css[len("state-"):]
+                self._sessions[key] = css[len("state-"):]
             else:
-                self._sessions.pop(res_id, None)
+                self._sessions.pop(key, None)
             self._tray_refresh()
-            ch = self._child_for(res_id)
+            ch = self._child_for(res_id, session)
             if not ch:
                 return
             pill, tile = ch._pill, ch._tile
             pill.remove_css_class("pill-connecting")
             tile.remove_css_class("tile-connected")
             if css == "state-connected":
-                pill.set_text("CONNECTED")
+                bind(pill, 'text', tr("CONNECTED"))
                 pill.set_visible(True)
                 tile.add_css_class("tile-connected")
             elif css == "state-connecting":
-                pill.set_text("CONNECTING")
+                bind(pill, 'text', tr("CONNECTING"))
                 pill.add_css_class("pill-connecting")
                 pill.set_visible(True)
             else:
                 pill.set_visible(False)
         GLib.idle_add(apply)
 
-    def _load_icons(self, resources):
-        children = {c._res["id"]: c for c in self._tiles}
-        token = self.token
+    def _load_icons(self, resources, session, tiles):
+        children = {c._res["id"]: c for c in tiles}
+        token = session.token
         for res in resources:
+            if session.removed:
+                return
             url = res.get("icon32")
             if not url:
                 continue
-            path = storage.icon_path(res["id"])
+            path = storage.icon_path(res["id"], session.directory)
             data = None
             if token:
                 try:
                     data = storage.bearer_bytes(url, token)
-                    os.makedirs(storage.ICON_DIR, exist_ok=True)
-                    with open(path, "wb") as f:
-                        f.write(data)
+                    with session.refresh_lock:
+                        if session.removed:
+                            return
+                        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+                        with open(path, "wb") as f:
+                            f.write(data)
                 except Exception:
                     data = None
             if data is None:            # no token, or the fetch failed → cache
@@ -876,58 +1306,118 @@ class AvdApp(Gtk.Application):
                 tex = Gdk.Texture.new_from_bytes(GLib.Bytes.new(data))
             except Exception:
                 continue
-            ch = children.get(res["id"])
-            if ch:
-                GLib.idle_add(ch._img.set_from_paintable, tex)
+            def apply(resource_id=res["id"], texture=tex):
+                if session.removed:
+                    return False
+                child = session.tiles.get(resource_id) or children.get(resource_id)
+                if child is not None and child._account is session:
+                    child._img.set_from_paintable(texture)
+                return False
+            GLib.idle_add(apply)
 
     # ---- launch + live connection state -----------------------------------
     def _on_tile_activated(self, flowbox, child, windowed=False):
+        session = child._account
+        if session.removed:
+            return
         res = child._res
         # Guard synchronously on the main thread: the second click of a
         # double-click arrives before the launch thread has set child._proc, so
         # a flag set here (not the proc handle) is what prevents a second launch.
         if getattr(child, "_launching", False) or (child._proc and child._proc.poll() is None):
-            self.status.set_text(f"{res['title']} is already open")
+            self._set_status(tr("{resource} is already open").format(resource=res['title']), session)
             return
+        attempt = ConnectionAttempt()
+        child._attempt = attempt
+        attempt.is_current = lambda: getattr(child, "_attempt", None) is attempt
         child._launching = True
-        self._set_tile_state(res["id"], "● Connecting…", "state-connecting")
-        self.status.set_text(f"Connecting to {res['title']}…")
-        self._set_connecting(res["id"], res["title"], True)
-        threading.Thread(target=self._launch, args=(child, res, windowed),
+        self._set_tile_state(res["id"], "state-connecting", session, attempt=attempt)
+        self._set_status(tr("Connecting to {resource}…").format(resource=res['title']), session, attempt=attempt)
+        self._set_connecting(res["id"], res["title"], True, session, attempt=attempt)
+        threading.Thread(target=self._launch, args=(child, res, windowed, session, attempt),
                          daemon=True).start()
 
-    def _launch(self, child, res, windowed=False):
-        if not self._ensure_token():
+    def _cancel_visible_connections(self):
+        for account_id, resource_id in tuple(self._connecting):
+            if self.view_mode != "all" and account_id != self.selected_id:
+                continue
+            session = self.accounts.get(account_id)
+            child = self._child_for(resource_id, session) if session else None
+            if child:
+                self._cancel_connection(child, child._res, session, getattr(child, "_attempt", None))
+
+    def _cancel_connection(self, child, res, session, attempt):
+        if attempt is None or not attempt.is_current():
+            return
+        attempt.cancel()
+        close_auth, attempt.close_auth = attempt.close_auth, None
+        if close_auth:
+            close_auth()
+        child._launching = False
+        child._proc = None
+        if session.pending_launch and session.pending_launch[0] == res["id"]:
+            session.pending_launch = None
+        # Guard the deferred cleanup by identity, even though this attempt is cancelled.
+        def clear():
+            if attempt.is_current():
+                self._set_connecting(res["id"], res["title"], False, session, attempt=attempt, allow_cancelled=True)
+                self._set_tile_state(res["id"], None, session, attempt=attempt, allow_cancelled=True)
+                self._set_status(tr("Connection cancelled"), session, attempt=attempt, allow_cancelled=True)
+            return GLib.SOURCE_REMOVE
+        clear()
+
+    def _launch(self, child, res, windowed, session, attempt=None):
+        if attempt is None:
+            attempt = ConnectionAttempt()
+            child._attempt = attempt
+            attempt.is_current = lambda: getattr(child, "_attempt", None) is attempt
+        if not attempt.active():
+            return
+        token_ready = self._ensure_token(session)
+        if not attempt.active():
+            return
+        if not token_ready:
             # Session lapsed and can't refresh silently — re-auth on demand
             # (like the Windows App when you click a workspace after a while),
             # keeping the workspace list intact.
-            child._launching = False
-            self._set_connecting(res["id"], res["title"], False)
-            self._set_tile_state(res["id"], "", None)
-            self._set_status("Sign in to connect")
-            self._pending_launch = (res["id"], windowed)   # connect automatically afterwards
-            GLib.idle_add(self._interactive_signin)
+            if attempt.is_current():
+                child._launching = False
+            self._set_connecting(res["id"], res["title"], False, session, attempt=attempt)
+            self._set_tile_state(res["id"], None, session, attempt=attempt)
+            self._set_status(tr("Sign in to connect"), session, attempt=attempt)
+            session.pending_launch = (res["id"], windowed)   # connect automatically afterwards
+            GLib.idle_add(lambda: self._interactive_signin(session) if attempt.active() else False)
             return
         try:
-            path = af.download_rdp(self.token, res)
+            with session.refresh_lock:
+                if session.removed or not attempt.active():
+                    if attempt.is_current():
+                        child._launching = False
+                    return
+                path = session.client.download_rdp(session.token, res)
+                if not attempt.active():
+                    return
         except (SystemExit, Exception) as e:  # never let a write/HTTP error hang the tile
-            child._launching = False
-            self._set_connecting(res["id"], res["title"], False)
+            if not attempt.active():
+                return
+            if attempt.is_current():
+                child._launching = False
+            self._set_connecting(res["id"], res["title"], False, session, attempt=attempt)
             self._error(str(e))
-            self._set_tile_state(res["id"], "● Failed", "state-ended")
+            self._set_tile_state(res["id"], "state-ended", session, attempt=attempt)
             return
-        # Host pools not set up for Entra ID RDP auth (their feed .rdp lacks
-        # "enablerdsaadauth:i:1") reject /sec:aad with HYBRID_REQUIRED_BY_SERVER
-        # (issue #3), so use /sec:nla there and let FreeRDP prompt for the account
-        # credentials itself. NLA against a pure Entra-joined host still can't
-        # succeed from Linux (PKU2U needs the Windows CloudAP/PRT), but a
-        # hybrid-AD-joined host works with on-prem-AD credentials. The gateway
-        # keeps using the Entra token either way.
         try:
-            rdp_text = open(path).read()
-        except OSError:
-            rdp_text = ""
-        nla = "enablerdsaadauth:i:1" not in rdp_text.lower()
+            security = resolve_security(path, self._eff("sec", res, session),
+                                        self._eff_extra(res, session),
+                                        session.auth_modes.get(res["id"]))
+        except (OSError, ValueError) as error:
+            child._launching = False
+            self._set_connecting(res["id"], res["title"], False, session)
+            self._set_tile_state(res["id"], "state-ended", session)
+            self._error(tr("Could not prepare authentication: {error}").format(error=error))
+            return
+        child._security_decision = security
+        nla = security.mode == "nla"
         env = dict(os.environ)
         # sdl-freerdp (SDL3) and FreeRDP's own AAD webview are unstable on native
         # Wayland (#2: "Error 71 dispatching to Wayland display"). Force X11 /
@@ -947,17 +1437,28 @@ class AvdApp(Gtk.Application):
         if config.SDL_LIBS and os.path.isdir(config.SDL_LIBS):
             env["LD_LIBRARY_PATH"] = config.SDL_LIBS + (
                 os.pathsep + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
-        os.makedirs(config.OUT, exist_ok=True)
         safe = _re.sub(r"[^A-Za-z0-9]+", "_", res["title"])[:40]
-        logpath = os.path.join(config.OUT, f"session_{safe}.log")
+        logpath = session_log_path(
+            session.client.output_dir,
+            f"session_{safe}_{hashlib.sha256(res['id'].encode()).hexdigest()[:16]}")
         argv = [config.SDL, path, "/gateway:type:arm", "/sec:nla" if nla else "/sec:aad"]
-        if af.upn:
-            argv.append(f"/u:{af.upn}")
+        if session.client.upn:
+            argv.append(f"/u:{session.client.upn}")
+        # RemoteApp (RAIL) tiles: the bundled SDL client can't render RAIL windows,
+        # so a RemoteApp can optionally be opened as the host's full DESKTOP instead
+        # (per-resource "Open as full desktop" setting, or AVD_REMOTEAPP=desktop).
+        # Keep RemoteApplicationProgram/loadBalanceInfo — AVD's ARM resolver needs
+        # them — and only flip remoteapplicationmode off, then connect as a normal
+        # desktop below. Off by default: RemoteApp tiles otherwise behave as before.
+        force_desktop = os.environ.get("AVD_REMOTEAPP", "").strip().lower() == "desktop" \
+            or self._eff("remoteapp", res, session) == "desktop"
+        if force_desktop and rdp_is_remoteapp(path):
+            set_rdp_desktop_mode(path)
         # Remote scale follows the client's display scale (HiDPI → 200%, standard/
         # ultrawide → 100%); AVD_SCALE overrides. Multi-monitor and any other flag
         # are opt-in via AVD_EXTRA_ARGS (e.g. "/multimon /gfx"), until a settings UI.
         # --- display config: env var > per-resource/default setting > auto ---
-        extra = self._eff_extra(res)
+        extra = shlex.join(security.options)
         if windowed:
             # A resizable window instead of /f: build_display_args drops the
             # fullscreen/smart-sizing/multimon flags and the feed's screen mode.
@@ -968,15 +1469,15 @@ class AvdApp(Gtk.Application):
         # needs "AzureAD" can override with /d: in Advanced flags).
         if nla and "/d:" not in extra:
             argv.append("/d:")
-        scale = os.environ.get("AVD_SCALE") or self._eff("scale", res) \
+        scale = os.environ.get("AVD_SCALE") or self._eff("scale", res, session) \
             or str(100 * max(1, self._scale))
         # Pin the host cert on first use by default; only turn the check off if
         # the user opted out (e.g. a pooled host pool whose certs rotate). Env
         # override: AVD_CERT=ignore / verify.
         cert_mode = os.environ.get("AVD_CERT", "").strip().lower() \
-            or self._eff("cert", res)
+            or self._eff("cert", res, session)
         cert_flag = "/cert:ignore" if cert_mode == "ignore" else "/cert:tofu"
-        apply_client_hotkeys(self._eff("hotkeys", res))
+        apply_client_hotkeys(self._eff("hotkeys", res, session))
         argv += ["/sound:sys:pulse", "/microphone", cert_flag,
                  f"/scale-desktop:{scale}", "/log-level:info",
                  # bandwidth/quality + resilience + keepalive:
@@ -991,16 +1492,27 @@ class AvdApp(Gtk.Application):
         elif mm in ("0", "off", "false", "no"):
             want_multimon = False
         else:
-            setting = self._eff("multimon", res)      # "on"/"off"/None
+            setting = self._eff("multimon", res, session)      # "on"/"off"/None
             want_multimon = (setting == "on") if setting else (self._n_monitors > 1)
         try:
             argv += build_display_args(path, extra, want_multimon)
         except (OSError, ValueError) as error:
-            child._launching = False
-            self._set_connecting(res["id"], res["title"], False)
-            self._set_tile_state(res["id"], "● Failed", "state-ended")
-            self._error(f"Could not prepare display settings: {error}")
+            if not attempt.active():
+                return
+            if attempt.is_current():
+                child._launching = False
+            self._set_connecting(res["id"], res["title"], False, session, attempt=attempt)
+            self._set_tile_state(res["id"], "state-ended", session, attempt=attempt)
+            self._error(tr("Could not prepare display settings: {error}").format(error=error))
             return
+        backend = workspace_backend()
+        workspace_title = None
+        if res.get("type") == "Desktop" and self._eff("new_workspace", res, session) == "on" \
+                and backend is not None and backend.available():
+            workspace_title = "AVD-" + uuid.uuid4().hex
+            # Last option wins over any custom /t flag. No resource/account data
+            # enters the Shell bridge; the random title also works across PID namespaces.
+            argv.append("/t:" + workspace_title)
         # Launch under a PTY. With FreeRDP built WITHOUT its own AAD webview,
         # /sec:aad prints "Browse to: <url>" and reads the redirect URL back
         # from stdin — but only when it thinks it's attached to a terminal, so
@@ -1008,27 +1520,58 @@ class AvdApp(Gtk.Application):
         # webview that shares the launcher's SSO cookies, making the
         # connection-time token silent. A new process group lets us tear down
         # the whole FreeRDP tree cleanly.
-        master, slave = pty.openpty()
-        try:
-            proc = subprocess.Popen(argv, env=env, stdin=slave, stdout=slave,
-                                    stderr=slave, start_new_session=True,
-                                    close_fds=True)
-        finally:
-            os.close(slave)
-        child._proc = proc
-        child._ptym = master
+        with session.refresh_lock:
+            if session.removed or not attempt.active():
+                if attempt.is_current():
+                    child._launching = False
+                self._set_connecting(res["id"], res["title"], False, session, attempt=attempt)
+                return
+            master, slave = pty.openpty()
+            try:
+                proc = subprocess.Popen(argv, env=env, stdin=slave, stdout=slave,
+                                        stderr=slave, start_new_session=True,
+                                        close_fds=True)
+                attempt.attach(proc)
+            except Exception as error:
+                os.close(master)
+                if not attempt.active():
+                    return
+                if attempt.is_current():
+                    child._launching = False
+                self._set_connecting(res["id"], res["title"], False, session, attempt=attempt)
+                self._set_tile_state(res["id"], None, session, attempt=attempt)
+                self._error(tr("Could not launch FreeRDP: {error}").format(error=error))
+                return
+            finally:
+                os.close(slave)
+        def publish():
+            child._workspace_placement = backend.create_placement(proc, workspace_title) if workspace_title else None
+            child._proc = proc
+            child._ptym = master
+        if not attempt.publish(publish):
+            attempt.cancel()
+            os.close(master)
+            return
         GLib.idle_add(self._tray_refresh)    # Focus/Disconnect now apply
-        self._set_status(f"Launched {res['title']}")
-        self._watch_session(child, res, proc, master, logpath)
+        self._set_status(tr("Launched {resource}").format(resource=res['title']), session, attempt=attempt)
+        self._watch_session(child, res, proc, master, logpath, session, attempt)
 
     _ANSI = _re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]")
 
-    def _watch_session(self, child, res, proc, master, logpath):
+    def _watch_session(self, child, res, proc, master, logpath, session, attempt=None):
         """Read sdl-freerdp's PTY output: flip the tile to 'Connected' on logon,
         service each 'Browse to:' AAD prompt silently, and tidy up on exit."""
-        state = {"connected": False}
+        attempt = attempt or getattr(child, "_attempt", None)
+        state = {"connected": False, "attempt": attempt}
         buf = b""
-        log = open(logpath, "wb")
+        try:
+            log = open(logpath, "xb")
+        except OSError:
+            log = open(os.devnull, "wb")
+        decision = getattr(child, "_security_decision", None)
+        if decision:
+            log.write(f"[AVD auth] mode={decision.mode}; reason={decision.reason}\n".encode())
+            log.flush()
         try:
             while True:
                 try:
@@ -1049,7 +1592,7 @@ class AvdApp(Gtk.Application):
                         raw, buf = buf.split(b"\n", 1)
                         line = self._ANSI.sub(b"", raw).decode("utf-8", "replace").strip()
                         if line:
-                            self._on_freerdp_line(child, res, master, line, state)
+                            self._on_freerdp_line(child, res, master, line, state, session)
                 elif proc.poll() is not None:
                     break
         finally:
@@ -1061,25 +1604,48 @@ class AvdApp(Gtk.Application):
                 os.close(master)
             except OSError:
                 pass
+        if attempt is not None and attempt.close_auth:
+            def close_pending_auth():
+                if attempt.close_auth:
+                    attempt.close_auth()
+                return GLib.SOURCE_REMOVE
+            GLib.idle_add(close_pending_auth)
+        if attempt is not None and not attempt.active():
+            return
         child._launching = False
-        self._set_connecting(res["id"], res["title"], False)  # ensure overlay clears
-        self._set_tile_state(res["id"], "○ Disconnected", "state-ended")
-        self._set_status(f"{res['title']} session ended")
+        self._set_connecting(res["id"], res["title"], False, session, attempt=attempt)  # ensure overlay clears
+        self._set_tile_state(res["id"], "state-ended", session, attempt=attempt)
+        self._set_status(tr("{resource} session ended").format(resource=res['title']), session, attempt=attempt)
         GLib.timeout_add_seconds(
-            6, lambda: (self._set_tile_state(res["id"], "", None), False)[1])
+            6, lambda: (self._set_tile_state(res["id"], None, session, attempt=attempt), False)[1])
 
-    def _on_freerdp_line(self, child, res, master, line, state):
+    def _on_freerdp_line(self, child, res, master, line, state, session):
         """Handle one line of FreeRDP output (called from the reader thread)."""
+        attempt = state.get("attempt", getattr(child, "_attempt", None))
+        if attempt is not None and not attempt.active():
+            return
         if not state["connected"] and "Logon Info" in line:
             state["connected"] = True
-            self._set_tile_state(res["id"], "● Connected", "state-connected")
-            self._set_status(f"Connected to {res['title']}")
-            self._set_connecting(res["id"], res["title"], False)  # desktop is up
+            decision = getattr(child, "_security_decision", None)
+            if decision:
+                def remember():
+                    try:
+                        session.remember_security(res["id"], decision.mode, decision.fingerprint)
+                    except OSError as error:
+                        print(f"Could not remember authentication mode: {type(error).__name__}", file=sys.stderr)
+                    return GLib.SOURCE_REMOVE
+                GLib.idle_add(remember)
+            placement = getattr(child, "_workspace_placement", None)
+            if placement:
+                GLib.idle_add(placement.start)
+            self._set_tile_state(res["id"], "state-connected", session, attempt=attempt)
+            self._set_status(tr("Connected to {resource}").format(resource=res['title']), session, attempt=attempt)
+            self._set_connecting(res["id"], res["title"], False, session, attempt=attempt)  # desktop is up
         if line.startswith("Browse to: "):
             url = line[len("Browse to: "):].strip()
             if config.is_aad_login_url(url):
                 # Resolve on the main thread (WebKit must run there).
-                GLib.idle_add(self._resolve_aad, master, url, res)
+                GLib.idle_add(self._resolve_aad, master, url, res, session, attempt)
             else:
                 # Never load an arbitrary URL in the SSO-cookie WebView; a blank
                 # line makes FreeRDP abort this auth instead of blocking on stdin.
@@ -1089,30 +1655,59 @@ class AvdApp(Gtk.Application):
                 except OSError:
                     pass
 
-    def _resolve_aad(self, master, url, res):
-        """Service FreeRDP's connection-time AAD prompt: load its authorize URL
-        in a hidden webview sharing our SSO cookies, and write the resulting
-        redirect URL back to FreeRDP's stdin. The window is shown only if it
-        doesn't resolve silently within 3s (i.e. MFA/consent is really needed)."""
-        wv = WebKit.WebView(network_session=self._web_session())
-        # Unpresented window: a WebView loads/navigates while its window is
-        # hidden (verified), so the silent path never flashes a window.
-        win = Gtk.Window(title=f"Sign in — {res['title']}", transient_for=self.win)
+    def _resolve_aad(self, master, url, res, session, attempt=None):
+        """Resolve one connection's AAD prompt; closing it cancels its attempt."""
+        if session.removed or (attempt is not None and not attempt.active()):
+            # FreeRDP is blocked on stdin waiting for the redirect URI. Signing
+            # out (session.removed) does not itself cancel the attempt, so cancel
+            # it here to kill the pending FreeRDP process group rather than leak
+            # it; if there is no live attempt, unblock FreeRDP so it aborts.
+            if attempt is not None and not attempt.cancelled.is_set():
+                attempt.cancel()
+            else:
+                try:
+                    os.write(master, b"\n")
+                except OSError:
+                    pass
+            return False
+        wv = WebKit.WebView(network_session=self._web_session(session))
+        self._apply_ua(wv)
+        win = create(Gtk.Window, title=tr("Sign in — {resource}").format(resource=res['title']), transient_for=self.win)
         win.set_default_size(520, 640)
         win.set_child(wv)
-        holder = {"done": False, "shown": False}
+        holder = {"done": False, "shown": False, "timer": 0}
 
-        def finish(redirect_uri):
+        def finish(redirect_uri=None):
             if holder["done"]:
                 return
             holder["done"] = True
-            try:
-                os.write(master, (redirect_uri + "\n").encode())
-            except OSError:
-                pass
+            if holder["timer"]:
+                GLib.source_remove(holder["timer"])
+                holder["timer"] = 0
+            wv.stop_loading()
+            if attempt is not None and attempt.close_auth is close_auth:
+                attempt.close_auth = None
+            if redirect_uri and not session.removed and (attempt is None or attempt.active()):
+                try:
+                    os.write(master, (redirect_uri + "\n").encode())
+                except OSError:
+                    pass
+            elif attempt is not None and not attempt.cancelled.is_set():
+                child = self._child_for(res["id"], session)
+                if child:
+                    self._cancel_connection(child, res, session, attempt)
+                else:
+                    attempt.cancel()
             win.destroy()
 
+        def close_auth(*_):
+            finish()
+            return True
+
         def on_decide(view, decision, dtype):
+            if holder["done"]:
+                decision.ignore()
+                return True
             if dtype == WebKit.PolicyDecisionType.NAVIGATION_ACTION:
                 uri = decision.get_navigation_action().get_request().get_uri()
                 if "nativeclient" in uri and "code=" in uri:
@@ -1121,29 +1716,24 @@ class AvdApp(Gtk.Application):
                     return True
             return False
 
-        def on_destroy(*_):
-            # Window closed before it resolved (user cancelled): send a blank
-            # line so FreeRDP aborts this auth instead of blocking on stdin.
-            if not holder["done"]:
-                holder["done"] = True
-                try:
-                    os.write(master, b"\n")
-                except OSError:
-                    pass
-
-        wv.connect("create", lambda *_a: None)     # block popups (no ghost windows)
+        wv.connect("create", lambda *_a: None)
         wv.connect("decide-policy", on_decide)
-        win.connect("close-request", lambda w: (w.destroy(), True)[1])
-        win.connect("destroy", on_destroy)
+        win.connect("close-request", close_auth)
+        win.connect("destroy", close_auth)
+        if attempt is not None:
+            attempt.close_auth = close_auth
         wv.load_uri(url)
 
         def show_if_pending():
-            if not holder["done"] and not holder["shown"]:
+            holder["timer"] = 0
+            if session.removed or (attempt is not None and not attempt.active()):
+                finish()
+            elif not holder["done"] and not holder["shown"]:
                 holder["shown"] = True
-                self._set_status(f"Signing in to {res['title']}…")
+                self._set_status(tr("Signing in to {resource}…").format(resource=res['title']), session, attempt=attempt)
                 win.present()
             return False
-        GLib.timeout_add(3000, show_if_pending)
+        holder["timer"] = GLib.timeout_add(3000, show_if_pending)
         return False
 
     # ---- tray icon ---------------------------------------------------------
@@ -1181,20 +1771,24 @@ class AvdApp(Gtk.Application):
         return root if os.path.exists(os.path.join(root, APP_ID + "-symbolic.svg")) else ""
 
     def _tray_refresh(self):
-        """Rebuild the tray menu from the grid (main thread)."""
         if not self._tray:
             return False
-        resources = [c._res for c in self._tiles]
-        sessions = {}
-        for c in self._tiles:
-            rid = c._res["id"]
-            running = bool(c._proc and c._proc.poll() is None)
-            state = self._sessions.get(rid) or ("connecting" if c._launching else "idle")
-            sessions[rid] = {"state": state, "running": running}
-        self._tray.set_menu(tray_menu.build_menu(resources, sessions))
-        n = sum(1 for s in self._sessions.values() if s == "connected")
-        self._tray.set_tooltip(f"{n} session" + ("" if n == 1 else "s") + " connected"
-                               if n else "")
+        accounts, states = [], {}
+        for session in self.accounts.values():
+            resources = list(session.resources)
+            known = {r['id'] for r in resources}
+            # Keep established sessions accessible if a feed stops listing them.
+            for rid, child in session.tiles.items():
+                running = bool(child._proc and child._proc.poll() is None)
+                state = self._sessions.get((session.id, rid)) or ("connecting" if child._launching else "idle")
+                states[(session.id, rid)] = {'running': running, 'state': state}
+                if running and rid not in known:
+                    resources.append(child._res)
+            accounts.append({'id': session.id, 'upn': session.display_name,
+                             'resources': resources, 'removed': session.removed})
+        self._tray.set_menu(tray_menu.build_accounts_menu(accounts, states))
+        n = sum(1 for state in states.values() if state['running'])
+        self._tray.set_tooltip(ngettext("{count} session connected", "{count} sessions connected", n).format(count=n) if n else "")
         return False
 
     def _show_window(self):
@@ -1227,7 +1821,7 @@ class AvdApp(Gtk.Application):
     def _on_tray_availability(self, available):
         for cb in self._tray_toggles:
             cb.set_sensitive(available)
-            cb.set_tooltip_text(None if available else "Needs a system tray on your desktop")
+            bind(cb, 'tooltip_text', None if available else tr("Needs a system tray on your desktop"))
         if available and self._start_hidden_source:
             # Started in the tray and the icon is up: stay hidden.
             GLib.source_remove(self._start_hidden_source)
@@ -1238,7 +1832,9 @@ class AvdApp(Gtk.Application):
             self._show_window()
 
     def _on_tray_action(self, action):
-        kind, rid = action[0], (action[1] if len(action) > 1 else None)
+        kind = action[0]
+        session = self.accounts.get(action[1]) if len(action) > 2 else self.current
+        rid = action[2] if len(action) > 2 else None
         if kind == "show":
             self._show_window()
         elif kind == "quit":
@@ -1246,29 +1842,37 @@ class AvdApp(Gtk.Application):
         elif kind == "refresh":
             self._reload_feed()
         elif kind in ("connect", "connect-windowed"):
-            ch = self._child_for(rid)
+            if session is None or session.removed:
+                return
+            ch = self._child_for(rid, session)
+            if ch is None:
+                resource = next((r for r in session.resources if r['id'] == rid), None)
+                if resource is not None:
+                    ch = self._make_tile(resource, session)
+                    session.tiles[rid] = ch
             if ch:
                 self._on_tile_activated(self.grid, ch, windowed=kind == "connect-windowed")
         elif kind in ("focus", "disconnect"):
-            ch = self._child_for(rid)
+            ch = self._child_for(rid, session)
             proc = ch._proc if ch else None
             if not proc or proc.poll() is not None:
                 return
             title = ch._res["title"]
             if kind == "focus":
                 if not x11focus.focus_pid(proc.pid):
-                    self._set_status(f"Couldn't bring {title} to the front")
+                    self._set_status(tr("Couldn't bring {resource} to the front").format(resource=title))
             else:
                 try:
                     os.killpg(proc.pid, signal.SIGTERM)   # own session (start_new_session)
                 except (ProcessLookupError, PermissionError):
                     pass
-                self._set_status(f"Disconnecting {title}…")
+                self._set_status(tr("Disconnecting {resource}…").format(resource=title))
 
     # ---- per-resource settings -------------------------------------------
-    def _eff(self, key, res):
+    def _eff(self, key, res, session=None):
         """Resolve a setting: per-resource value → global default → None(=auto)."""
-        rv = self._settings.get(res["id"], {}).get(key, "auto")
+        session = session or self.current
+        rv = (session.resource_settings if session else {}).get(res["id"], {}).get(key, "auto")
         if rv and rv != "auto":
             return rv
         dv = self._settings.get("_default", {}).get(key, "auto")
@@ -1276,95 +1880,307 @@ class AvdApp(Gtk.Application):
             return dv
         return None
 
-    def _eff_extra(self, res):
+    def _eff_ua(self):
+        """Resolve the sign-in webview User-Agent, or "" for the device's own
+        WebKit UA. It is a single account-wide value (the Default setting): every
+        sign-in webview shares one persistent SSO cookie session, so they must
+        all present the same identity or Entra refuses the silent token. A
+        per-resource UA would only ever work when it equalled this, so there
+        isn't one — this covers the account sign-in and every connection."""
+        dv = self._settings.get("_default", {}).get("user_agent", "auto")
+        return dv if dv and dv != "auto" else ""
+
+    def _apply_ua(self, wv):
+        """Spoof the sign-in webview's User-Agent when configured (issue #28)."""
+        ua = self._eff_ua()
+        if ua:
+            try:
+                wv.get_settings().set_user_agent(ua)
+            except Exception:
+                pass
+
+    def _eff_extra(self, res, session):
         parts = [self._settings.get("_default", {}).get("extra_args", ""),
-                 self._settings.get(res["id"], {}).get("extra_args", ""),
+                 session.resource_settings.get(res["id"], {}).get("extra_args", ""),
                  os.environ.get("AVD_EXTRA_ARGS", "")]
         return " ".join(p.strip() for p in parts if p and p.strip()).strip()
 
     def _form_row(self, label, widget):
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        lbl = Gtk.Label(label=label, xalign=0)
+        lbl = create(Gtk.Label, label=label, xalign=0)
         lbl.set_hexpand(True)
         widget.set_halign(Gtk.Align.END)
         row.append(lbl)
         row.append(widget)
         return row
 
-    def _open_settings(self, res):
+    def _open_settings(self, res, session=None):
+        session = session or self.current
+        settings = session.resource_settings if res and session else self._settings
         key = res["id"] if res else "_default"
-        cur = self._settings.get(key, {})
-        title = f"Settings — {res['title']}" if res else "Default connection settings"
-        auto_note = ("Automatic uses your Default settings, then the display."
-                     if res else "Automatic matches your display and monitors.")
+        cur = settings.get(key, {})
+        title = tr("Settings — {resource}").format(resource=res['title']) if res else tr("Default connection settings")
+        auto_note = (tr("Automatic uses your Default settings, then the display.")
+                     if res else tr("Automatic matches your display and monitors."))
 
-        dlg = Gtk.Window(title=title, transient_for=self.win, modal=True)
+        dlg = create(Gtk.Window, title=title, transient_for=self.win, modal=True)
+        dlg.add_css_class("avd-settings")
         dlg.set_default_size(440, -1)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         for m in ("top", "bottom", "start", "end"):
             getattr(box, f"set_margin_{m}")(16)
 
-        scale_dd = Gtk.DropDown(model=Gtk.StringList.new(storage.SCALE_LABELS))
+        # Language is an app-wide preference, shown only in the Default settings
+        # dialog (res is None). It applies immediately and is persisted on change
+        # rather than waiting for Save, matching how it behaved in the menu.
+        if res is None:
+            language_keys = [key for key, label in LANGUAGES]
+            language_dd = create(Gtk.DropDown, model=strings([tr(label) for key, label in LANGUAGES]))
+            current_language = self._settings.get("_language", "system")
+            language_dd.set_selected(language_keys.index(current_language)
+                                     if current_language in language_keys else 0)
+            box.append(self._form_row(tr("Language"), language_dd))
+            language_note = create(Gtk.Label, label=tr("Language changes apply immediately."),
+                                   xalign=0, wrap=True)
+            language_note.add_css_class("tile-sub")
+            box.append(language_note)
+
+            def change_language(dropdown, *_args):
+                if getattr(self, "_changing_language", False):
+                    return
+                self._settings["_language"] = language_keys[dropdown.get_selected()]
+                storage.save_settings(self._settings)
+                self._set_language(self._settings["_language"])
+            language_dd.connect("notify::selected", change_language)
+
+        scale_dd = create(Gtk.DropDown, model=strings([tr(label) for label in storage.SCALE_LABELS]))
         sv = cur.get("scale", "auto")
         scale_dd.set_selected(storage.SCALE_VALUES.index(sv) if sv in storage.SCALE_VALUES else 0)
-        box.append(self._form_row("Display scale", scale_dd))
+        box.append(self._form_row(tr("Display scale"), scale_dd))
 
-        mm_dd = Gtk.DropDown(model=Gtk.StringList.new(storage.MULTIMON_LABELS))
+        mm_dd = create(Gtk.DropDown, model=strings([tr(label) for label in storage.MULTIMON_LABELS]))
         mv = cur.get("multimon", "auto")
         mm_dd.set_selected(storage.MULTIMON_VALUES.index(mv) if mv in storage.MULTIMON_VALUES else 0)
-        box.append(self._form_row("Monitors", mm_dd))
+        box.append(self._form_row(tr("Monitors"), mm_dd))
 
-        cert_dd = Gtk.DropDown(model=Gtk.StringList.new(storage.CERT_LABELS))
+        cert_dd = create(Gtk.DropDown, model=strings([tr(label) for label in storage.CERT_LABELS]))
         cv = cur.get("cert", "auto")
         cert_dd.set_selected(storage.CERT_VALUES.index(cv) if cv in storage.CERT_VALUES else 0)
-        box.append(self._form_row("Server certificate", cert_dd))
+        box.append(self._form_row(tr("Server certificate"), cert_dd))
 
-        hk_dd = Gtk.DropDown(model=Gtk.StringList.new(storage.HOTKEY_LABELS))
+        sec_dd = create(Gtk.DropDown, model=strings([tr(label) for label in storage.SEC_LABELS]))
+        sec_value = cur.get("sec", "auto")
+        sec_dd.set_selected(storage.SEC_VALUES.index(sec_value) if sec_value in storage.SEC_VALUES else 0)
+        box.append(self._form_row(tr("Session authentication"), sec_dd))
+        auth_note = create(Gtk.Label, xalign=0, wrap=True,
+            label=tr("Automatic respects the feed and remembers successful connections. If your feed does not advertise SSO, select Entra to test it. This does not bypass MFA or your organization's sign-in policy."))
+        auth_note.add_css_class("tile-sub")
+        box.append(auth_note)
+
+        # RemoteApp (published single app) tiles can optionally open as the host's
+        # full desktop — the fallback for when the app's own window doesn't appear
+        # (the bundled client's RAIL rendering is limited). Only meaningful for a
+        # RemoteApp resource, so the control is shown only there; desktops never
+        # see it. It is a per-resource choice, off by default.
+        remoteapp_dd = None
+        if res is not None and res.get("type") == "RemoteApp":
+            remoteapp_dd = create(Gtk.DropDown,
+                model=strings([tr(label) for label in storage.REMOTEAPP_LABELS]))
+            rav = cur.get("remoteapp", "auto")
+            remoteapp_dd.set_selected(storage.REMOTEAPP_VALUES.index(rav)
+                                      if rav in storage.REMOTEAPP_VALUES else 0)
+            box.append(self._form_row(tr("Open RemoteApp as"), remoteapp_dd))
+            remoteapp_note = create(Gtk.Label, xalign=0, wrap=True,
+                label=tr("Full desktop opens the whole remote PC so you can launch the app yourself — use this if the app window never appears."))
+            remoteapp_note.add_css_class("tile-sub")
+            box.append(remoteapp_note)
+
+        hk_dd = create(Gtk.DropDown, model=strings([tr(label) for label in storage.HOTKEY_LABELS]))
         hv = cur.get("hotkeys", "auto")
+        custom_hotkeys = hv if isinstance(hv, dict) else {}
+        hv = "custom" if isinstance(hv, dict) else hv
         hk_dd.set_selected(storage.HOTKEY_VALUES.index(hv) if hv in storage.HOTKEY_VALUES else 0)
-        box.append(self._form_row("Client shortcuts", hk_dd))
+        box.append(self._form_row(tr("Client shortcuts"), hk_dd))
+
+        hotkey_note = create(Gtk.Label,
+            label=tr("Right Shift + D disconnects. Choose Disabled to send all keys to the remote PC, or Custom to change shortcuts. All actions share the same modifiers."),
+            xalign=0, wrap=True)
+        hotkey_note.add_css_class("tile-sub")
+        box.append(hotkey_note)
+
+        shortcut_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        shortcut_note = create(Gtk.Label, label=tr("Hold all selected modifiers, then press the action key."),
+                               xalign=0, wrap=True)
+        shortcut_box.append(shortcut_note)
+        modifier_grid = Gtk.Grid(column_spacing=12, row_spacing=4)
+        modifier_checks = {}
+        selected_modifiers = custom_hotkeys.get("modifiers", ["KMOD_RCTRL", "KMOD_RSHIFT"])
+        for index, (modifier, label) in enumerate(HOTKEY_MODIFIER_NAMES.items()):
+            check = create(Gtk.CheckButton, label=tr(label))
+            check.set_active(modifier in selected_modifiers)
+            modifier_checks[modifier] = check
+            modifier_grid.attach(check, index % 2, index // 2, 1, 1)
+        shortcut_box.append(modifier_grid)
+        action_dropdowns = {}
+        for action, label in HOTKEY_ACTIONS.items():
+            value = custom_hotkeys.get("bindings", {}).get(action, HOTKEY_DEFAULTS[action])
+            labels = [key.removeprefix("SDL_SCANCODE_") for key in HOTKEY_KEYS]
+            if value not in HOTKEY_KEYS:
+                labels.append(str(value))
+            dropdown = Gtk.DropDown(model=Gtk.StringList.new(
+                labels))
+            dropdown.set_name(action)
+            dropdown.set_selected(HOTKEY_KEYS.index(value) if value in HOTKEY_KEYS
+                                  else len(HOTKEY_KEYS))
+            action_dropdowns[action] = dropdown
+            shortcut_box.append(self._form_row(tr(label), dropdown))
+        reset_shortcuts = create(Gtk.Button, label=tr("Restore FreeRDP shortcuts"))
+        def reset_bindings(*_):
+            for modifier, check in modifier_checks.items():
+                check.set_active(modifier == "KMOD_RSHIFT")
+            for action, dropdown in action_dropdowns.items():
+                dropdown.set_selected(HOTKEY_KEYS.index(HOTKEY_DEFAULTS[action]))
+            hk_dd.set_selected(storage.HOTKEY_VALUES.index("defaults"))
+        reset_shortcuts.connect("clicked", reset_bindings)
+        shortcut_box.append(reset_shortcuts)
+        shortcut_error = create(Gtk.Label, label=tr("Select at least one modifier and a different key for each action."),
+                                xalign=0, wrap=True)
+        shortcut_error.add_css_class("error")
+        shortcut_box.append(shortcut_error)
+        custom_index = storage.HOTKEY_VALUES.index("custom")
+        def validate_shortcuts(*_):
+            valid = (any(check.get_active() for check in modifier_checks.values())
+                     and all(dd.get_selected() < len(HOTKEY_KEYS) for dd in action_dropdowns.values())
+                     and len({dd.get_selected() for dd in action_dropdowns.values()}) == len(action_dropdowns))
+            shortcut_error.set_visible(not valid)
+            save.set_sensitive(hk_dd.get_selected() != custom_index or valid)
+        def update_shortcuts(*_):
+            shortcut_box.set_visible(hk_dd.get_selected() == custom_index)
+            validate_shortcuts()
+        hk_dd.connect("notify::selected", update_shortcuts)
+        for check in modifier_checks.values():
+            check.connect("toggled", validate_shortcuts)
+        for dropdown in action_dropdowns.values():
+            dropdown.connect("notify::selected", validate_shortcuts)
+        shortcut_box.set_visible(hv == "custom")
+        box.append(shortcut_box)
+
+        workspace_values = storage.WORKSPACE_VALUES if res else storage.WORKSPACE_DEFAULT_VALUES
+        workspace_labels = storage.WORKSPACE_LABELS if res else storage.WORKSPACE_DEFAULT_LABELS
+        workspace_dd = create(Gtk.DropDown, model=strings([tr(label) for label in workspace_labels]))
+        workspace_value = cur.get("new_workspace", "auto" if res else "off")
+        workspace_dd.set_selected(workspace_values.index(workspace_value) if workspace_value in workspace_values else 0)
+        workspace_dd.set_sensitive(res is None or res.get("type") == "Desktop")
+        workspace_row = self._form_row(tr("Start connection in a new virtual desktop"), workspace_dd)
+        workspace_supported = workspace_backend() is not None
+        workspace_row.set_visible(workspace_supported)
+        box.append(workspace_row)
+        workspace_note = create(Gtk.Label, label=tr("Desktop connections only. Requires the optional GNOME extension; switches to the new workspace when connected."), xalign=0, wrap=True)
+        workspace_note.set_visible(workspace_supported)
+        workspace_note.add_css_class("tile-sub")
+        box.append(workspace_note)
+
+        # Sign-in browser identity (User-Agent). Lets a tenant that blocks Linux
+        # at sign-in via Conditional Access be satisfied by posing as Edge/Chrome
+        # on Windows (issue #28). Stored value is the literal UA string; "Custom…"
+        # reveals an entry. It is account-wide (Default only, not per resource):
+        # every sign-in webview shares one SSO session, so a per-resource identity
+        # that differed from the account's would just fail to connect.
+        ua_dd = None
+        if res is None:
+            uav = cur.get("user_agent", "auto")
+            ua_dd = create(Gtk.DropDown, model=strings([tr(label) for label in storage.UA_LABELS]))
+            ua_entry = Gtk.Entry()
+            ua_entry.set_hexpand(True)
+            bind(ua_entry, 'placeholder_text', tr("paste a User-Agent string"))
+            if uav in storage.UA_PRESETS:
+                ua_dd.set_selected(storage.UA_PRESETS.index(uav))
+            else:
+                ua_dd.set_selected(len(storage.UA_LABELS) - 1)   # "Custom…"
+                bind(ua_entry, 'text', uav)
+            box.append(self._form_row(tr("Sign-in browser"), ua_dd))
+            ua_entry_row = self._form_row(tr("Custom identity"), ua_entry)
+            ua_entry_row.set_visible(ua_dd.get_selected() == len(storage.UA_LABELS) - 1)
+            box.append(ua_entry_row)
+            ua_dd.connect(
+                "notify::selected",
+                lambda dd, *_: ua_entry_row.set_visible(
+                    dd.get_selected() == len(storage.UA_LABELS) - 1))
 
         extra_entry = Gtk.Entry()
-        extra_entry.set_text(cur.get("extra_args", ""))
-        extra_entry.set_placeholder_text("advanced: e.g. /gfx /network:auto")
+        bind(extra_entry, 'text', cur.get("extra_args", ""))
+        bind(extra_entry, 'placeholder_text', tr("advanced: e.g. /gfx /network:auto"))
         extra_entry.set_hexpand(True)
-        box.append(self._form_row("Advanced flags", extra_entry))
+        box.append(self._form_row(tr("Advanced flags"), extra_entry))
 
-        note = Gtk.Label(label=auto_note + " Applies to your next connection.",
+        note = create(Gtk.Label, label=tr("{automatic} Applies to your next connection.").format(automatic=auto_note),
                          xalign=0, wrap=True)
         note.add_css_class("tile-sub")
         box.append(note)
 
         btnbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         btnbox.set_halign(Gtk.Align.END)
-        cancel = Gtk.Button(label="Cancel")
+        cancel = create(Gtk.Button, label=tr("Cancel"))
         cancel.connect("clicked", lambda *_: dlg.destroy())
-        save = Gtk.Button(label="Save")
+        save = create(Gtk.Button, label=tr("Save"))
         save.add_css_class("suggested-action")
 
         def do_save(*_):
+            validate_shortcuts()
+            if not save.get_sensitive():
+                return
+            hotkeys = storage.HOTKEY_VALUES[hk_dd.get_selected()]
+            if hotkeys == "custom":
+                hotkeys = {"modifiers": [key for key, check in modifier_checks.items() if check.get_active()],
+                           "bindings": {action: HOTKEY_KEYS[dd.get_selected()]
+                                        for action, dd in action_dropdowns.items()}}
             entry = {
                 "scale": storage.SCALE_VALUES[scale_dd.get_selected()],
                 "multimon": storage.MULTIMON_VALUES[mm_dd.get_selected()],
                 "cert": storage.CERT_VALUES[cert_dd.get_selected()],
-                "hotkeys": storage.HOTKEY_VALUES[hk_dd.get_selected()],
+                "sec": storage.SEC_VALUES[sec_dd.get_selected()],
+                "hotkeys": hotkeys,
+                "new_workspace": workspace_values[workspace_dd.get_selected()],
                 "extra_args": extra_entry.get_text().strip(),
             }
+            if ua_dd is not None:   # Default settings only; account-wide (issue #28)
+                ua_sel = ua_dd.get_selected()
+                if ua_sel == len(storage.UA_LABELS) - 1:        # "Custom…"
+                    entry["user_agent"] = ua_entry.get_text().strip() or "auto"
+                else:
+                    entry["user_agent"] = storage.UA_PRESETS[ua_sel]
+            if remoteapp_dd is not None:   # RemoteApp resources only
+                entry["remoteapp"] = storage.REMOTEAPP_VALUES[remoteapp_dd.get_selected()]
             # drop an all-default entry so the file stays tidy
             if entry["scale"] == "auto" and entry["multimon"] == "auto" \
-                    and entry["cert"] == "auto" and entry["hotkeys"] == "auto" \
+                    and entry["cert"] == "auto" and entry["sec"] == "auto" and entry["hotkeys"] == "auto" \
+                    and entry["new_workspace"] == ("auto" if res else "off") \
+                    and entry.get("user_agent", "auto") == "auto" \
+                    and entry.get("remoteapp", "auto") == "auto" \
                     and not entry["extra_args"]:
-                self._settings.pop(key, None)
+                settings.pop(key, None)
             else:
-                self._settings[key] = entry
-            storage.save_settings(self._settings)
+                settings[key] = entry
+            if res:
+                session.save_preferences()
+            else:
+                storage.save_settings(self._settings)
             dlg.destroy()
-            self._set_status("Settings saved — applies to your next connection")
+            self._set_status(tr("Settings saved — applies to your next connection"))
+        validate_shortcuts()
         save.connect("clicked", do_save)
         btnbox.append(cancel)
         btnbox.append(save)
-        box.append(btnbox)
-        dlg.set_child(box)
+        scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER,
+                                     propagate_natural_height=True, max_content_height=660)
+        scroller.set_child(box)
+        scroller.set_vexpand(True)
+        layout = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        layout.append(scroller)
+        for margin in ("bottom", "start", "end"):
+            getattr(btnbox, f"set_margin_{margin}")(16)
+        layout.append(btnbox)
+        dlg.set_child(layout)
         dlg.present()
 
     def _error(self, msg):
@@ -1372,7 +2188,7 @@ class AvdApp(Gtk.Application):
             self._show_window()
             d = Gtk.AlertDialog()
             d.set_modal(True)
-            d.set_message(msg)
+            bind(d, 'message', msg)
             d.show(self.win)
         GLib.idle_add(show)
 
